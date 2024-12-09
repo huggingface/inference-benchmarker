@@ -96,6 +96,7 @@ impl Scheduler {
         let results = self.results.clone();
         let progress_tx = self.progress_tx.clone();
         let mut stop_receiver = self.stop_sender.subscribe();
+        let req_gen = self.requests_generator.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = stop_receiver.recv() => {
@@ -103,6 +104,11 @@ impl Scheduler {
                 }
                 _ = async{
                     while let Some(response) = rx.recv().await{
+                        // call generator callback
+                        let response_txt=response.response.clone();
+                        if let Some(request)= response.request.clone(){
+                            req_gen.lock().await.callback(request, response_txt.unwrap_or_default().as_str());
+                        }
                         let result = results.clone();
                         let progress_tx = progress_tx.clone();
                         trace!("Received response: {:?}", response);
@@ -183,7 +189,7 @@ mod tests {
     #[tokio::test]
     async fn test_constant_vus_scheduler() {
         let (progress_tx, _) = tokio::sync::mpsc::channel(10000);
-        let (stop_sender, _) = tokio::sync::broadcast::channel(1);
+        let (stop_sender, _) = broadcast::channel(1);
         let backend = Box::new(crate::requests::DummyTextGenerationBackend::new(
             Duration::from_secs(1),
         ));
@@ -196,7 +202,7 @@ mod tests {
             ExecutorType::ConstantVUs,
             ExecutorConfig {
                 max_vus: 800,
-                duration: std::time::Duration::from_secs(10),
+                duration: Duration::from_secs(10),
                 rate: None,
             },
             requests_generator,
@@ -235,7 +241,7 @@ mod tests {
             tokenizer,
             time::Duration::from_secs(10),
         )
-        .unwrap();
+            .unwrap();
         let requests_generator = Arc::from(Mutex::from(
             crate::requests::DummyTextRequestGenerator::new(),
         ));
@@ -245,7 +251,7 @@ mod tests {
             ExecutorType::ConstantArrivalRate,
             ExecutorConfig {
                 max_vus: 800,
-                duration: std::time::Duration::from_secs(10),
+                duration: Duration::from_secs(10),
                 rate: Some(50.0),
             },
             requests_generator,

@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use hf_hub::api::sync::ApiBuilder;
@@ -10,19 +12,19 @@ use reqwest_eventsource::{Error, Event, EventSource};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicI64;
 use std::sync::{Arc, Mutex};
 use std::time;
 use tokenizers::{FromPretrainedParameters, Tokenizer};
-use tokio::sync::mpsc::Sender;
-use tokio::time::sleep;
+use tokio::sync::mpsc::{Sender};
+use tokio::time::{sleep, Instant};
+use uuid::{Uuid};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct TextGenerationRequest {
+    pub id: Option<Uuid>,
     pub prompt: String,
-    pub num_prompt_tokens: u64, // this includes the system prompt if present
+    pub num_prompt_tokens: u64,
     pub num_decode_tokens: Option<u64>,
-    pub system_prompt: Option<String>,
 }
 
 #[async_trait]
@@ -123,23 +125,11 @@ impl TextGenerationBackend for OpenAITextGenerationBackend {
         sender: Sender<TextGenerationAggregatedResponse>,
     ) {
         let url = format!("{base_url}/v1/chat/completions", base_url = self.base_url);
-        let mut aggregated_response = TextGenerationAggregatedResponse::default();
-        let messages = match &request.system_prompt {
-            None => vec![OpenAITextGenerationMessage {
-                role: "user".to_string(),
-                content: request.prompt.clone(),
-            }],
-            Some(system_prompt) => vec![
-                OpenAITextGenerationMessage {
-                    role: "system".to_string(),
-                    content: system_prompt.clone(),
-                },
-                OpenAITextGenerationMessage {
-                    role: "user".to_string(),
-                    content: request.prompt.clone(),
-                },
-            ],
-        };
+        let mut aggregated_response = TextGenerationAggregatedResponse::new(request.clone());
+        let messages = vec![OpenAITextGenerationMessage {
+            role: "user".to_string(),
+            content: request.prompt.clone(),
+        }];
         let body = OpenAITextGenerationRequest {
             model: self.model_name.clone(),
             messages,
@@ -158,7 +148,7 @@ impl TextGenerationBackend for OpenAITextGenerationBackend {
             .json(&serde_json::json!(body))
             .timeout(self.timeout);
         // start timer
-        aggregated_response.start(request.num_prompt_tokens);
+        aggregated_response.start();
         let mut es = EventSource::new(req).unwrap();
         let mut final_response = "".to_string();
         while let Some(event) = es.next().await {
@@ -287,8 +277,8 @@ impl TextGenerationBackend for DummyTextGenerationBackend {
         request: Arc<TextGenerationRequest>,
         sender: Sender<crate::requests::TextGenerationAggregatedResponse>,
     ) {
-        let mut response = TextGenerationAggregatedResponse::default();
-        response.start(request.num_prompt_tokens);
+        let mut response = TextGenerationAggregatedResponse::new(request.clone());
+        response.start();
         let num_tokens = request.num_decode_tokens.unwrap_or(10);
         let time_per_token = self
             .time_to_generate
@@ -308,13 +298,10 @@ impl TextGenerationBackend for DummyTextGenerationBackend {
 
 pub trait TextRequestGenerator: Sync {
     fn generate_request(&mut self) -> TextGenerationRequest;
+    /// callback can be used by generators to add new requests to the queue based on the response (e.g. for multi-turn conversation generation)
+    fn callback(&mut self, request: Arc<TextGenerationRequest>, response: &str);
 }
 
-#[derive(Clone)]
-pub struct ConversationTextRequestGenerator {
-    pub requests: Vec<TextGenerationRequest>,
-    current_index: Arc<AtomicI64>,
-}
 
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Conversation {
@@ -366,7 +353,46 @@ impl Display for TokenizeOptions {
     }
 }
 
+#[derive(Clone, Eq, PartialEq)]
+pub struct ConversationTurnRequest {
+    id: Uuid,
+    priority: u64,
+    tie: Instant,
+    request: TextGenerationRequest,
+}
+
+impl Ord for ConversationTurnRequest {
+    // order by increasing priority and decreasing tie-breaking
+    // this way, we can pop the item with the highest priority and oldest tie-breaking
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.priority.cmp(&other.priority).then_with(|| self.tie.cmp(&other.tie).reverse())
+    }
+}
+
+impl PartialOrd for ConversationTurnRequest {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+
+#[derive(Clone)]
+pub struct ConversationTextRequestGenerator {
+    pub requests: HashMap<Uuid, ConversationTurnRequest>,
+    pub queue: BinaryHeap<ConversationTurnRequest>,
+    pub tokenizer: Arc<Tokenizer>,
+}
+
 impl ConversationTextRequestGenerator {
+    /// Load a conversation dataset from a JSON file
+    /// The JSON file should be an array of objects, each object representing a conversation entry
+    /// Each conversation entry should have an `id` field and a `conversations` field
+    /// The `conversations` field should be an array of objects, each object representing a turn in the conversation
+    /// Each turn should have a `role` field and a `content` field
+    /// The `role` field should be either "user" or "system"
+    /// The `content` field should be the text of the turn
+    /// All conversation turns are tokenized and converted into `TextGenerationRequest`. The `id` field is used to link turns in the conversation,
+    /// so that each `TextGenerationRequest` has a reference to the next turn in the conversation.
     pub fn load(
         filepath: PathBuf,
         tokenizer: String,
@@ -389,7 +415,7 @@ impl ConversationTextRequestGenerator {
         let input = std::fs::read_to_string(&filepath)?;
         let data: Vec<ConversationEntry> = serde_json::from_str(&input).expect("Unable to parse input file. Check that it is valid JSON and matches the expected format.");
         // generate requests
-        let requests: Arc<Mutex<Vec<TextGenerationRequest>>> = Arc::from(Mutex::from(Vec::new()));
+        let requests: Arc<Mutex<HashMap<Uuid, ConversationTurnRequest>>> = Arc::from(Mutex::from(HashMap::new()));
         info!(
             "Generating requests from {filepath}",
             filepath = filepath.display().to_string()
@@ -404,89 +430,87 @@ impl ConversationTextRequestGenerator {
                 if entry.conversations.is_empty() {
                     continue;
                 }
-                let system_prompt = entry
+                let mut turn_idx = 0;
+                let ids = (0..entry.conversations.len()).map(|_| Uuid::new_v4()).collect::<Vec<Uuid>>();
+                let filtered_conversations = entry
                     .conversations
                     .iter()
-                    .find(|c| c.role == "system")
-                    .map(|c| c.content.clone());
-                let system_prompt_tokens = match system_prompt {
-                    Some(ref prompt) => {
-                        let (_, num_tokens) = match tokenize_prompt(
-                            prompt.clone(),
-                            tokenizer.clone(),
-                            &TokenizeOptions::default(),
-                        ) {
-                            Ok((prompt, num_tokens)) => (prompt, num_tokens),
-                            Err(e) => {
-                                debug!("Error tokenizing system prompt: {e}");
-                                return;
-                            }
-                        };
-                        num_tokens
-                    }
-                    None => 0,
-                };
-                entry
-                    .conversations
-                    .iter()
-                    .filter(|c| c.role == "user")
-                    .for_each(|c| {
-                        let prompt = c.content.clone();
-                        let num_decode_tokens = decode_tokenize_opts.clone().map_or_else(
-                            || None,
-                            |opts| {
-                                opts.num_tokens.map(|num_tokens| {
-                                    sample_num_tokens(
-                                        num_tokens,
-                                        opts.min_tokens,
-                                        opts.max_tokens,
-                                        opts.variance,
-                                    )
-                                })
-                            },
-                        );
-                        match &prompt_tokenize_opts {
-                            None => {
-                                let (_, num_tokens) = match tokenize_prompt(
-                                    prompt.clone(),
-                                    tokenizer.clone(),
-                                    &TokenizeOptions::default(),
-                                ) {
-                                    Ok((prompt, num_tokens)) => (prompt, num_tokens),
-                                    Err(e) => {
-                                        debug!("Error tokenizing prompt: {e}");
-                                        return;
-                                    }
-                                };
-                                requests.lock().unwrap().push(TextGenerationRequest {
+                    .filter(|c| c.role == "user" || c.role == "system")
+                    .collect::<Vec<&Conversation>>();
+                for c in &filtered_conversations {
+                    let prompt = c.content.clone();
+                    let num_decode_tokens = decode_tokenize_opts.clone().map_or_else(
+                        || None,
+                        |opts| {
+                            opts.num_tokens.map(|num_tokens| {
+                                sample_num_tokens(
+                                    num_tokens,
+                                    opts.min_tokens,
+                                    opts.max_tokens,
+                                    opts.variance,
+                                )
+                            })
+                        },
+                    );
+                    let next_id = if turn_idx == entry.conversations.len() - 1 {
+                        None
+                    } else {
+                        Some(ids[turn_idx + 1].clone()) // link to next turn in the conversation
+                    };
+                    debug!("Prompt: {prompt}", prompt = prompt);
+                    match &prompt_tokenize_opts {
+                        None => {
+                            let (_, num_tokens) = match tokenize_prompt(
+                                prompt.clone(),
+                                tokenizer.clone(),
+                                &TokenizeOptions::default(),
+                            ) {
+                                Ok((prompt, num_tokens)) => (prompt, num_tokens),
+                                Err(e) => {
+                                    debug!("Error tokenizing prompt: {e}");
+                                    return;
+                                }
+                            };
+                            requests.lock().unwrap().insert(ids[turn_idx], ConversationTurnRequest {
+                                id: ids[turn_idx],
+                                priority: turn_idx as u64,
+                                tie: Instant::now(),
+                                request: TextGenerationRequest {
+                                    id: next_id,
                                     prompt,
-                                    num_prompt_tokens: num_tokens + system_prompt_tokens,
+                                    num_prompt_tokens: num_tokens,
                                     num_decode_tokens,
-                                    system_prompt: system_prompt.clone(),
-                                });
-                            }
-                            Some(options) => {
-                                // compute number of tokens to generate using a Gaussian distribution
-                                let (sampled_prompt, prompt_tokens) = match tokenize_prompt(
-                                    prompt.clone(),
-                                    tokenizer.clone(),
-                                    options,
-                                ) {
-                                    Ok(prompt) => prompt,
-                                    Err(e) => {
-                                        debug!("Error tokenizing prompt: {e}");
-                                        return;
-                                    }
-                                };
-                                requests.lock().unwrap().push(TextGenerationRequest {
-                                    prompt: sampled_prompt,
-                                    num_prompt_tokens: prompt_tokens + system_prompt_tokens,
-                                    num_decode_tokens,
-                                    system_prompt: system_prompt.clone(),
-                                });
-                            }
+                                },
+                            });
                         }
-                    });
+                        Some(options) => {
+                            // compute number of tokens to generate using a Gaussian distribution
+                            let (sampled_prompt, prompt_tokens) = match tokenize_prompt(
+                                prompt.clone(),
+                                tokenizer.clone(),
+                                options,
+                            ) {
+                                Ok(prompt) => prompt,
+                                Err(e) => {
+                                    debug!("Error tokenizing prompt: {e}");
+                                    return;
+                                }
+                            };
+                            requests.lock().unwrap().insert(ids[turn_idx], ConversationTurnRequest {
+                                id: ids[turn_idx],
+                                tie: Instant::now(),
+                                priority: turn_idx as u64,
+                                request: TextGenerationRequest {
+                                    id: next_id,
+                                    prompt: sampled_prompt,
+                                    num_prompt_tokens: prompt_tokens,
+                                    num_decode_tokens,
+                                },
+                            });
+                        }
+                    }
+                    turn_idx += 1;
+                };
                 // TODO: check that we have enough requests
             }
         });
@@ -495,9 +519,12 @@ impl ConversationTextRequestGenerator {
             "Generated {num_requests} requests",
             num_requests = requests.len()
         );
+        // create the queue from the hashmap. Only queue first turns in the conversation
+        let queue = BinaryHeap::from(requests.values().cloned().filter(|item| item.priority == 0).collect::<Vec<ConversationTurnRequest>>());
         Ok(Self {
-            current_index: Arc::from(AtomicI64::new(0)),
-            requests: requests.to_vec(),
+            requests: requests.clone(),
+            tokenizer,
+            queue,
         })
     }
 
@@ -540,14 +567,68 @@ fn entry_splitter(
 
 impl TextRequestGenerator for ConversationTextRequestGenerator {
     fn generate_request(&mut self) -> TextGenerationRequest {
-        let idx = self
-            .current_index
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if idx >= (self.requests.len() - 1) as i64 {
-            self.current_index
-                .store(0, std::sync::atomic::Ordering::SeqCst);
+        let item = self.queue.pop().expect("Queue is empty");
+        // add the item back to the end of the queue if it is a first turn in the conversation
+        if item.priority == 0 {
+            let mut cloned_item = item.clone();
+            cloned_item.tie = Instant::now(); // update the tie-breaking for intra-priority sorting
+            self.queue.push(cloned_item);
         }
-        self.requests[idx as usize].clone()
+        item.request
+    }
+
+    /// Use callback to add a new chat turn to the queue.
+    /// The turn is generated from the `TextGenerationRequest`, using the `id` field to link it to
+    /// the next turn in the conversation.
+    /// Those turns must be scheduled as soon as possible so that we may benefit from
+    /// KV cache hits. The `priority` field is used to move the turn to the front of the queue.
+    fn callback(&mut self, request: Arc<TextGenerationRequest>, response: &str) {
+        // retrieve current turn id
+        let id = match request.id {
+            None => {
+                return;
+            }
+            Some(id) => {
+                id
+            }
+        };
+        // retrieve next turn from id
+        let next_request = match self.requests.get(&id) {
+            None => {
+                return;
+            }
+            Some(request) => {
+                request
+            }
+        };
+        // create a new turn with the prompt concatenated with the response and next turn's prompt
+        // and add the next turn id to the new turn
+        let new_prompt = request.prompt.clone() + "\n" + response + "\n" + next_request.request.prompt.as_str();
+        // tokenize the prompt
+        let (prompt, num_tokens) = match tokenize_prompt(
+            new_prompt.to_string(),
+            self.tokenizer.clone(),
+            &TokenizeOptions::default(),
+        ) {
+            Ok((prompt, num_tokens)) => (prompt, num_tokens),
+            Err(_) => {
+                return;
+            }
+        };
+        let next_id = next_request.request.id;
+        let turn = ConversationTurnRequest {
+            id,
+            priority: 100, // move to the front of the queue
+            tie: Instant::now(), // use the current time as tie-breaking (older turns have higher priority)
+            request: TextGenerationRequest {
+                id: next_id,
+                prompt,
+                num_prompt_tokens: num_tokens,
+                num_decode_tokens: request.num_decode_tokens, // decode tokens do not change between turns
+            },
+        };
+        //debug!("Adding new turn to queue: {turn}", turn = turn.request.prompt);
+        self.queue.push(turn);
     }
 }
 
@@ -568,12 +649,13 @@ impl Default for DummyTextRequestGenerator {
 impl TextRequestGenerator for DummyTextRequestGenerator {
     fn generate_request(&mut self) -> TextGenerationRequest {
         TextGenerationRequest {
+            id: None,
             prompt: "Hello, world!".to_string(),
             num_prompt_tokens: 2,
             num_decode_tokens: Some(10),
-            system_prompt: None,
         }
     }
+    fn callback(&mut self, _request: Arc<TextGenerationRequest>, _response: &str) {}
 }
 
 fn tokenize_prompt(
@@ -624,45 +706,45 @@ pub struct TextGenerationAggregatedResponse {
     pub start_time: Option<tokio::time::Instant>,
     pub end_time: Option<tokio::time::Instant>,
     pub num_generated_tokens: u64,
-    pub num_prompt_tokens: u64,
-    pub times_to_tokens: Vec<std::time::Duration>,
+    pub times_to_tokens: Vec<time::Duration>,
     last_received_token_time: tokio::time::Instant,
     pub failed: bool,
     pub ended: bool,
+    pub request: Option<Arc<TextGenerationRequest>>,
+    pub response: Option<String>,
 }
 
-impl Default for TextGenerationAggregatedResponse {
-    fn default() -> Self {
+impl TextGenerationAggregatedResponse {
+    pub fn new(request: Arc<TextGenerationRequest>) -> Self {
         Self {
             start_time: None,
             end_time: None,
             num_generated_tokens: 0,
-            num_prompt_tokens: 0,
             times_to_tokens: Vec::new(),
             last_received_token_time: tokio::time::Instant::now(),
             failed: false,
             ended: false,
+            request: Some(request),
+            response: None,
         }
     }
-}
 
-impl TextGenerationAggregatedResponse {
     pub fn new_as_ended() -> Self {
         Self {
             start_time: None,
             end_time: None,
             num_generated_tokens: 0,
-            num_prompt_tokens: 0,
             times_to_tokens: Vec::new(),
             last_received_token_time: tokio::time::Instant::now(),
             failed: false,
             ended: true,
+            request: None,
+            response: None,
         }
     }
-    fn start(&mut self, num_prompt_tokens: u64) {
+    fn start(&mut self) {
         self.start_time = Some(tokio::time::Instant::now());
         self.last_received_token_time = tokio::time::Instant::now();
-        self.num_prompt_tokens = num_prompt_tokens;
     }
 
     fn stop(&mut self) {
@@ -745,12 +827,12 @@ mod tests {
             tokenizer,
             time::Duration::from_secs(10),
         )
-        .unwrap();
+            .unwrap();
         let request = TextGenerationRequest {
+            id: None,
             prompt: "Hello, world!".to_string(),
             num_prompt_tokens: 2,
             num_decode_tokens: Some(10),
-            system_prompt: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let request = Arc::new(request);
@@ -805,12 +887,12 @@ mod tests {
             tokenizer,
             time::Duration::from_secs(10),
         )
-        .unwrap();
+            .unwrap();
         let request = TextGenerationRequest {
+            id: None,
             prompt: "Hello, world!".to_string(),
             num_prompt_tokens: 2,
             num_decode_tokens: Some(16),
-            system_prompt: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let request = Arc::new(request);
@@ -857,7 +939,7 @@ mod tests {
         assert!(
             inter_token_latency_avg > expected_inter_token_latency_avg
                 && inter_token_latency_avg
-                    < expected_inter_token_latency_avg + inter_token_latency_overhead,
+                < expected_inter_token_latency_avg + inter_token_latency_overhead,
             "inter_token_latency_avg: {:?} < {:?} < {:?}",
             expected_inter_token_latency_avg,
             inter_token_latency_avg,
@@ -890,12 +972,12 @@ mod tests {
             tokenizer,
             time::Duration::from_secs(10),
         )
-        .unwrap();
+            .unwrap();
         let request = TextGenerationRequest {
+            id: None,
             prompt: "Hello, world!".to_string(),
             num_prompt_tokens: 2,
             num_decode_tokens: Some(16),
-            system_prompt: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let request = Arc::new(request);
@@ -936,12 +1018,12 @@ mod tests {
             tokenizer,
             time::Duration::from_secs(10),
         )
-        .unwrap();
+            .unwrap();
         let request = TextGenerationRequest {
+            id: None,
             prompt: "Hello, world!".to_string(),
             num_prompt_tokens: 2,
             num_decode_tokens: Some(16),
-            system_prompt: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let request = Arc::new(request);
@@ -982,12 +1064,12 @@ mod tests {
             tokenizer,
             time::Duration::from_secs(10),
         )
-        .unwrap();
+            .unwrap();
         let request = TextGenerationRequest {
+            id: None,
             prompt: "Hello, world!".to_string(),
             num_prompt_tokens: 2,
             num_decode_tokens: Some(16),
-            system_prompt: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let request = Arc::new(request);
@@ -1019,7 +1101,7 @@ mod tests {
             .with_chunked_body(|w| {
                 w.write_all(b"data: {\"choices\": [{\"message\": null, \"finish_reason\": null, \"delta\": {\"content\": \"Hello, world!\"}}]}\n\n").unwrap();
                 // sleep for 5s
-                sleep(std::time::Duration::from_secs(5));
+                sleep(Duration::from_secs(5));
                 w.write_all(b"data: [DONE]\n\n")
             })
             .create_async().await;
@@ -1030,14 +1112,14 @@ mod tests {
             url,
             "gpt2".to_string(),
             tokenizer,
-            time::Duration::from_secs(1),
+            Duration::from_secs(1),
         )
-        .unwrap();
+            .unwrap();
         let request = TextGenerationRequest {
+            id: None,
             prompt: "Hello, world!".to_string(),
             num_prompt_tokens: 2,
             num_decode_tokens: Some(16),
-            system_prompt: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let request = Arc::new(request);
@@ -1072,8 +1154,8 @@ mod tests {
             Some(decode_tokenize_opts),
             hf_token,
         )
-        .unwrap();
-        assert_eq!(generator.requests.len(), 17005);
+            .unwrap();
+        assert_eq!(generator.requests.len(), 17016);
     }
 
     /// Test that conversations are bounded by the min/max number of tokens
@@ -1096,17 +1178,17 @@ mod tests {
             Some(decode_tokenize_opts),
             hf_token,
         )
-        .unwrap();
+            .unwrap();
         let min_tokens = generator
             .requests
             .iter()
-            .map(|r| r.num_prompt_tokens)
+            .map(|r| r.1.request.num_prompt_tokens)
             .min()
             .unwrap();
         let max_tokens = generator
             .requests
             .iter()
-            .map(|r| r.num_prompt_tokens)
+            .map(|r| r.1.request.num_prompt_tokens)
             .max()
             .unwrap();
         assert!(min_tokens >= 4, "Min tokens: {}", min_tokens);
@@ -1133,9 +1215,127 @@ mod tests {
             Some(decode_tokenize_opts),
             hf_token,
         )
-        .unwrap();
+            .unwrap();
         for r in generator.requests.iter() {
-            assert_eq!(r.num_prompt_tokens, 200);
+            assert_eq!(r.1.request.num_prompt_tokens, 200);
         }
     }
+
+    /// Test that multi-turn conversations are correctly loaded
+    /// The test data contains 2 conversations first with 6 turns and the second with 1 turn and a system prompt
+    #[tokio::test]
+    async fn test_load_conversations_multi_turn() {
+        let filepath = PathBuf::from("test_data/chat.json");
+        let tokenizer = "gpt2".to_string();
+        let prompt_tokenize_opts = TokenizeOptions {
+            num_tokens: None,
+            min_tokens: 1,
+            max_tokens: 200,
+            variance: 0,
+        };
+        let hf_token = None;
+        let decode_tokenize_opts = TokenizeOptions::default();
+        let generator = ConversationTextRequestGenerator::load(
+            filepath,
+            tokenizer,
+            Some(prompt_tokenize_opts),
+            Some(decode_tokenize_opts),
+            hf_token,
+        )
+            .unwrap();
+        let turns = generator.requests.into_iter().map(|r| r.1.clone()).collect::<Vec<ConversationTurnRequest>>();
+        assert_eq!(turns.len(), 8);
+        let first_turns = turns.clone().into_iter().filter(|t| t.priority == 0);
+        // we expect to have 2 None values for the first turn in each conversation
+        assert_eq!(first_turns.count(), 2);
+        let first_conversation = turns.clone().into_iter().filter(|t| t.request.prompt == "Summarize the main ideas of Jeff Walker's Product Launch Formula into bullet points as it pertains to a growth marketing agency implementing these strategies and tactics for their clients...").collect::<Vec<ConversationTurnRequest>>();
+        // rebuild the conversation from first turn
+        let mut conversation = Vec::new();
+        let mut current_turn = first_conversation[0].clone();
+        loop {
+            conversation.push(current_turn.clone());
+            match turns.iter().find(|t| t.id == current_turn.request.id.unwrap_or_default()) {
+                Some(t) => current_turn = t.clone(),
+                None => break,
+            }
+        }
+        assert_eq!(conversation.len(), 6);
+        let got = conversation.iter().map(|t| t.request.prompt.clone()).collect::<Vec<String>>().join("\n");
+        let expect = "Summarize the main ideas of Jeff Walker's Product Launch Formula into bullet points as it pertains to a growth marketing agency implementing these strategies and tactics for their clients...\nSummarize the main ideas of Brendon Burchard's Experts Academy into bullet points as it pertains to a growth marketing agency implementing these strategies and tactics for their clients...\nWhat are the mental triggers in Jeff Walker's Product Launch Formula and \"Launch\" book?\nWrite a summary of why scarcity and urgency are the strongest mental triggers and have been the driving force behind many of our best performing campaigns over the last 8 years.\nSummarize Russell Brunson's Perfect Webinar Script...\nSummarize the 6 human needs as Tony Robbins explains...";
+        assert_eq!(expect, got);
+    }
+
+    /// Test that only first turns of multi-turn conversations are queued
+    #[tokio::test]
+    async fn test_conversation_queue() {
+        let filepath = PathBuf::from("test_data/chat.json");
+        let tokenizer = "gpt2".to_string();
+        let prompt_tokenize_opts = TokenizeOptions {
+            num_tokens: None,
+            min_tokens: 1,
+            max_tokens: 200,
+            variance: 0,
+        };
+        let hf_token = None;
+        let decode_tokenize_opts = TokenizeOptions::default();
+        let mut generator = ConversationTextRequestGenerator::load(
+            filepath,
+            tokenizer,
+            Some(prompt_tokenize_opts),
+            Some(decode_tokenize_opts),
+            hf_token,
+        )
+            .unwrap();
+        for i in 0..20 {
+            let req = generator.generate_request();
+            if i % 2 == 0 { // first turn of the first conversation
+                assert_eq!(req.prompt, "Summarize the main ideas of Jeff Walker's Product Launch Formula into bullet points as it pertains to a growth marketing agency implementing these strategies and tactics for their clients...");
+            }
+            if i % 2 == 1 { // first turn of the second conversation
+                assert_eq!(req.prompt, "You are a helpful assistant.");
+            }
+        }
+    }
+
+    /// Test that multi-turn conversations are correctly queued when we add responses
+    #[tokio::test]
+    async fn test_conversation_turns_queue() {
+        let filepath = PathBuf::from("test_data/chat.json");
+        let tokenizer = "gpt2".to_string();
+        let prompt_tokenize_opts = TokenizeOptions {
+            num_tokens: None,
+            min_tokens: 1,
+            max_tokens: 200,
+            variance: 0,
+        };
+        let hf_token = None;
+        let decode_tokenize_opts = TokenizeOptions::default();
+        let mut generator = ConversationTextRequestGenerator::load(
+            filepath,
+            tokenizer,
+            Some(prompt_tokenize_opts),
+            Some(decode_tokenize_opts),
+            hf_token,
+        )
+            .unwrap();
+        // generate the first user turn
+        let req = generator.generate_request();
+        let response = "This is my response".to_string();
+        generator.callback(Arc::from(req), &response);
+        // now try to generate the next user turn
+        let req = generator.generate_request();
+        // we expect to have all the turns concatenated into the prompt
+        assert_eq!(req.prompt, "Summarize the main ideas of Jeff Walker's Product Launch Formula into bullet points as it pertains to a growth marketing agency implementing these strategies and tactics for their clients...\nThis is my response\nSummarize the main ideas of Brendon Burchard's Experts Academy into bullet points as it pertains to a growth marketing agency implementing these strategies and tactics for their clients...");
+        assert_eq!(req.num_prompt_tokens, 76);
+        // now add a response to the second turn
+        let response = "This is my second response".to_string();
+        generator.callback(Arc::from(req), &response);
+        // now try to generate the next user turn
+        let req = generator.generate_request();
+        assert_eq!(req.prompt, "Summarize the main ideas of Jeff Walker's Product Launch Formula into bullet points as it pertains to a growth marketing agency implementing these strategies and tactics for their clients...\nThis is my response\nSummarize the main ideas of Brendon Burchard's Experts Academy into bullet points as it pertains to a growth marketing agency implementing these strategies and tactics for their clients...\nThis is my second response\nWhat are the mental triggers in Jeff Walker's Product Launch Formula and \"Launch\" book?");
+        // check that next turn is a first turn
+        let req = generator.generate_request();
+        assert_eq!(req.prompt, "You are a helpful assistant.");
+    }
 }
+

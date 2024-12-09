@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 pub use crate::app::run_console;
 pub use crate::benchmark::{BenchmarkConfig, BenchmarkKind};
+pub use crate::profiles::apply_profile;
 use crate::benchmark::{Event, MessageEvent};
 use crate::requests::OpenAITextGenerationBackend;
 pub use crate::requests::TokenizeOptions;
@@ -28,10 +29,12 @@ mod results;
 mod scheduler;
 mod table;
 mod writers;
+mod profiles;
 
 pub struct RunConfiguration {
     pub url: String,
     pub tokenizer_name: String,
+    pub profile: Option<String>,
     pub max_vus: u64,
     pub duration: std::time::Duration,
     pub rates: Option<Vec<f64>>,
@@ -48,10 +51,26 @@ pub struct RunConfiguration {
     pub model_name: String,
 }
 
-pub async fn run(run_config: RunConfiguration, stop_sender: Sender<()>) -> anyhow::Result<()> {
+pub async fn run(mut run_config: RunConfiguration, stop_sender: Sender<()>) -> anyhow::Result<()> {
     info!("Starting benchmark");
     // set process system limits
     sysinfo::set_open_files_limit(0);
+    // apply profile if needed
+    run_config = match run_config.profile.clone() {
+        None => run_config,
+        Some(profile) => {
+            match apply_profile(profile.as_str(), run_config) {
+                Ok(config) => { 
+                    info!("Profile applied: {}", profile);
+                    config
+                },
+                Err(e) => {
+                    error!("Failed to apply profile: {:?}", e);
+                    return Err(e);
+                }
+            }
+        }
+    };
     // initialize tokenizer
     let params = FromPretrainedParameters {
         token: run_config.hf_token.clone(),
@@ -88,6 +107,7 @@ pub async fn run(run_config: RunConfiguration, stop_sender: Sender<()>) -> anyho
         prompt_options: run_config.prompt_options.clone(),
         decode_options: run_config.decode_options.clone(),
         tokenizer: run_config.tokenizer_name.clone(),
+        profile: run_config.profile.clone(),
         extra_metadata: run_config.extra_metadata.clone(),
     };
     config.validate()?;
@@ -144,7 +164,7 @@ pub async fn run(run_config: RunConfiguration, stop_sender: Sender<()>) -> anyho
         run_config.dataset_file,
         run_config.hf_token.clone(),
     )
-    .expect("Can't download dataset");
+        .expect("Can't download dataset");
     let requests = requests::ConversationTextRequestGenerator::load(
         filepath,
         run_config.tokenizer_name.clone(),

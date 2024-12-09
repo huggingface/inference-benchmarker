@@ -91,14 +91,14 @@ impl BenchmarkResults {
     pub fn total_tokens_sent(&self) -> u64 {
         self.get_successful_responses()
             .iter()
-            .map(|response| response.num_prompt_tokens)
+            .map(|response| response.request.clone().unwrap().num_prompt_tokens)
             .sum()
     }
 
     pub fn total_prompt_tokens(&self) -> u64 {
         self.get_successful_responses()
             .iter()
-            .map(|response| response.num_prompt_tokens)
+            .map(|response| response.request.clone().unwrap().num_prompt_tokens)
             .sum()
     }
 
@@ -352,14 +352,21 @@ impl BenchmarkReport {
 
 #[cfg(test)]
 mod test {
+    use std::sync::Arc;
+    use crate::requests::TextGenerationRequest;
     use super::*;
     #[test]
     fn test_time_to_first_token_percentile() {
-        let mut response1 = TextGenerationAggregatedResponse::default();
+        let request = Arc::from(TextGenerationRequest {
+            id: None,
+            prompt: "test".to_string(),
+            num_prompt_tokens: 10,
+            num_decode_tokens: None,
+        });
+        let mut response1 = TextGenerationAggregatedResponse::new(request.clone());
         response1.start_time = Some(tokio::time::Instant::now());
         response1.end_time =
             Some(tokio::time::Instant::now() + tokio::time::Duration::from_millis(100));
-        response1.num_prompt_tokens = 10;
         response1.num_generated_tokens = 100;
         response1.failed = false;
         response1.times_to_tokens = vec![
@@ -370,11 +377,10 @@ mod test {
             Duration::from_millis(500),
         ];
 
-        let mut response2 = TextGenerationAggregatedResponse::default();
+        let mut response2 = TextGenerationAggregatedResponse::new(request.clone());
         response2.start_time = Some(tokio::time::Instant::now());
         response2.end_time =
             Some(tokio::time::Instant::now() + tokio::time::Duration::from_millis(200));
-        response2.num_prompt_tokens = 10;
         response2.num_generated_tokens = 100;
         response2.failed = false;
         response2.times_to_tokens = vec![
@@ -385,11 +391,10 @@ mod test {
             Duration::from_millis(1000),
         ];
 
-        let mut response3 = TextGenerationAggregatedResponse::default();
+        let mut response3 = TextGenerationAggregatedResponse::new(request.clone());
         response3.start_time = Some(tokio::time::Instant::now());
         response3.end_time =
             Some(tokio::time::Instant::now() + tokio::time::Duration::from_millis(300));
-        response3.num_prompt_tokens = 10;
         response3.num_generated_tokens = 100;
         response3.failed = false;
         response3.times_to_tokens = vec![
@@ -400,11 +405,10 @@ mod test {
             Duration::from_millis(1500),
         ];
 
-        let mut response4 = TextGenerationAggregatedResponse::default();
+        let mut response4 = TextGenerationAggregatedResponse::new(request.clone());
         response4.start_time = Some(tokio::time::Instant::now());
         response4.end_time =
             Some(tokio::time::Instant::now() + tokio::time::Duration::from_millis(300));
-        response4.num_prompt_tokens = 10;
         response4.num_generated_tokens = 100;
         response4.failed = false;
         response4.times_to_tokens = vec![

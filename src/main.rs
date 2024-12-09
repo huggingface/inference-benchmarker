@@ -19,10 +19,24 @@ struct Args {
     model_name: Option<String>,
 
     /// The maximum number of virtual users to use
-    #[clap(default_value = "128", short, long, env)]
+    #[clap(
+        default_value = "128",
+        short,
+        long,
+        env,
+        group = "group_manual",
+        conflicts_with = "group_profile"
+    )]
     max_vus: u64,
     /// The duration of each benchmark step
-    #[clap(default_value = "120s", short, long, env)]
+    #[clap(
+        default_value = "120s",
+        short,
+        long,
+        env,
+        group = "group_manual",
+        conflicts_with = "group_profile"
+    )]
     #[arg(value_parser = parse_duration)]
     duration: Duration,
     /// A list of rates of requests to send per second (only valid for the ConstantArrivalRate benchmark).
@@ -32,12 +46,28 @@ struct Args {
     /// The rates will be linearly spaced up to the detected maximum rate
     #[clap(default_value = "10", long, env)]
     num_rates: u64,
-
+    /// A benchmark profile to use
+    #[clap(long, env, group = "group_profile", conflicts_with = "group_manual")]
+    profile: Option<String>,
     /// The kind of benchmark to run (throughput, sweep, optimum)
-    #[clap(default_value = "sweep", short, long, env)]
+    #[clap(
+        default_value = "sweep",
+        short,
+        long,
+        env,
+        group = "group_manual",
+        conflicts_with = "group_profile"
+    )]
     benchmark_kind: String,
     /// The duration of the prewarm step ran before the benchmark to warm up the backend (JIT, caches, etc.)
-    #[clap(default_value = "30s", short, long, env)]
+    #[clap(
+        default_value = "30s",
+        short,
+        long,
+        env,
+        group = "group_manual",
+        conflicts_with = "group_profile"
+    )]
     #[arg(value_parser = parse_duration)]
     warmup: Duration,
     /// The URL of the backend to benchmark. Must be compatible with OpenAI Message API
@@ -57,7 +87,13 @@ struct Args {
     /// * variance: variance in the number of prompt tokens
     ///
     /// Example: num_tokens=200,max_tokens=210,min_tokens=190,variance=10
-    #[clap(long, env, value_parser(parse_tokenizer_options))]
+    #[clap(
+        long,
+        env,
+        value_parser(parse_tokenizer_options),
+        group = "group_manual",
+        conflicts_with = "group_profile"
+    )]
     prompt_options: Option<TokenizeOptions>,
     /// Constraints for the generated text.
     /// We sample the number of tokens to generate from a normal distribution.
@@ -68,13 +104,31 @@ struct Args {
     /// * variance: variance in the number of generated tokens
     ///
     /// Example: num_tokens=200,max_tokens=210,min_tokens=190,variance=10
-    #[clap(long, env, value_parser(parse_tokenizer_options))]
+    #[clap(
+        long,
+        env,
+        value_parser(parse_tokenizer_options),
+        group = "group_manual",
+        conflicts_with = "group_profile"
+    )]
     decode_options: Option<TokenizeOptions>,
     /// Hugging Face dataset to use for prompt generation
-    #[clap(default_value = "hlarcher/share_gpt_small", long, env)]
+    #[clap(
+        default_value = "hlarcher/share_gpt_small",
+        long,
+        env,
+        group = "group_manual",
+        conflicts_with = "group_profile"
+    )]
     dataset: String,
     /// File to use in the Dataset
-    #[clap(default_value = "share_gpt_filtered_small.json", long, env)]
+    #[clap(
+        default_value = "share_gpt_filtered_small.json",
+        long,
+        env,
+        group = "group_manual",
+        conflicts_with = "group_profile"
+    )]
     dataset_file: String,
     /// Extra metadata to include in the benchmark results file, comma-separated key-value pairs.
     /// It can be, for example, used to include information about the configuration of the
@@ -133,8 +187,8 @@ fn parse_tokenizer_options(s: &str) -> Result<TokenizeOptions, Error> {
     }
     if tokenizer_options.num_tokens.is_some()
         && (tokenizer_options.num_tokens.unwrap() == 0
-            || tokenizer_options.min_tokens == 0
-            || tokenizer_options.max_tokens == 0)
+        || tokenizer_options.min_tokens == 0
+        || tokenizer_options.max_tokens == 0)
     {
         return Err(Error::new(InvalidValue));
     }
@@ -181,6 +235,7 @@ async fn main() {
         .unwrap_or(args.tokenizer_name.clone());
     let run_config = RunConfiguration {
         url: args.url.clone(),
+        profile: args.profile.clone(),
         tokenizer_name: args.tokenizer_name.clone(),
         max_vus: args.max_vus,
         duration: args.duration,

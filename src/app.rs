@@ -328,7 +328,8 @@ impl Widget for &App {
             Some(_) => "Manual".to_string(),
         };
         let config_text = Text::from(vec![Line::from(vec![
-            format!("Benchmark: {kind} | Max VUs: {max_vus} | Duration: {duration} sec | Rates: {rates} | Warmup: {warmup} sec",
+            format!("Profile: {profile} | Benchmark: {kind} | Max VUs: {max_vus} | Duration: {duration} sec | Rates: {rates} | Warmup: {warmup} sec",
+                    profile = self.benchmark_config.profile.clone().unwrap_or("N/A".to_string()),
                     kind = self.benchmark_config.benchmark_kind,
                     max_vus = self.benchmark_config.max_vus,
                     duration = self.benchmark_config.duration.as_secs_f64(),

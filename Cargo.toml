@@ -34,6 +34,7 @@ serde_with = "3.9.0"
 sysinfo = "0.31.4"
 mockito = "1.5.0"
 tabled = "=0.14"
+uuid = { version = "1.11.0", features = ["v4", "fast-rng"] }
 
 [build-dependencies]
 vergen-gitcl = { version = "1.0.1" }
