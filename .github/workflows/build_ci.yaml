@@ -18,7 +18,13 @@ concurrency:
 
 jobs:
   rust:
+    permissions:
+      pull-requests: write
+      contents: read
     uses: ./.github/workflows/rust.yaml
   build:
+    permissions:
+      packages: write
+      contents: read
     uses: ./.github/workflows/build.yaml
     needs: rust
