@@ -1,4 +1,4 @@
-name: Build and push docker image to internal registry
+name: Build and push docker image to registry
 
 on:
   workflow_call:
@@ -36,7 +36,7 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            registry.internal.huggingface.tech/api-inference/inference-benchmarker
+            ghcr.io/huggingface/inference-benchmarker
           tags: |
             type=raw,value=sha-${{ env.GITHUB_SHA_SHORT }}${{ env.LABEL }}
       # If main, release or tag
