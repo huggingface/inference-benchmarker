@@ -352,9 +352,9 @@ impl BenchmarkReport {
 
 #[cfg(test)]
 mod test {
-    use std::sync::Arc;
-    use crate::requests::TextGenerationRequest;
     use super::*;
+    use crate::requests::TextGenerationRequest;
+    use std::sync::Arc;
     #[test]
     fn test_time_to_first_token_percentile() {
         let request = Arc::from(TextGenerationRequest {

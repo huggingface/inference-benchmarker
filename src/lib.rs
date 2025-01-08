@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 pub use crate::app::run_console;
 pub use crate::benchmark::{BenchmarkConfig, BenchmarkKind};
-pub use crate::profiles::apply_profile;
 use crate::benchmark::{Event, MessageEvent};
+pub use crate::profiles::apply_profile;
 use crate::requests::OpenAITextGenerationBackend;
 pub use crate::requests::TokenizeOptions;
 use chrono::Local;
@@ -24,12 +24,12 @@ mod benchmark;
 mod event;
 mod executors;
 mod flux;
+mod profiles;
 mod requests;
 mod results;
 mod scheduler;
 mod table;
 mod writers;
-mod profiles;
 
 pub struct RunConfiguration {
     pub url: String,
@@ -58,18 +58,16 @@ pub async fn run(mut run_config: RunConfiguration, stop_sender: Sender<()>) -> a
     // apply profile if needed
     run_config = match run_config.profile.clone() {
         None => run_config,
-        Some(profile) => {
-            match apply_profile(profile.as_str(), run_config) {
-                Ok(config) => { 
-                    info!("Profile applied: {}", profile);
-                    config
-                },
-                Err(e) => {
-                    error!("Failed to apply profile: {:?}", e);
-                    return Err(e);
-                }
+        Some(profile) => match apply_profile(profile.as_str(), run_config) {
+            Ok(config) => {
+                info!("Profile applied: {}", profile);
+                config
             }
-        }
+            Err(e) => {
+                error!("Failed to apply profile: {:?}", e);
+                return Err(e);
+            }
+        },
     };
     // initialize tokenizer
     let params = FromPretrainedParameters {
@@ -164,7 +162,7 @@ pub async fn run(mut run_config: RunConfiguration, stop_sender: Sender<()>) -> a
         run_config.dataset_file,
         run_config.hf_token.clone(),
     )
-        .expect("Can't download dataset");
+    .expect("Can't download dataset");
     let requests = requests::ConversationTextRequestGenerator::load(
         filepath,
         run_config.tokenizer_name.clone(),

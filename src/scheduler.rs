@@ -241,7 +241,7 @@ mod tests {
             tokenizer,
             time::Duration::from_secs(10),
         )
-            .unwrap();
+        .unwrap();
         let requests_generator = Arc::from(Mutex::from(
             crate::requests::DummyTextRequestGenerator::new(),
         ));

@@ -1,5 +1,3 @@
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use hf_hub::api::sync::ApiBuilder;
@@ -10,14 +8,16 @@ use rayon::iter::split;
 use rayon::prelude::*;
 use reqwest_eventsource::{Error, Event, EventSource};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 use std::fmt::Display;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time;
 use tokenizers::{FromPretrainedParameters, Tokenizer};
-use tokio::sync::mpsc::{Sender};
+use tokio::sync::mpsc::Sender;
 use tokio::time::{sleep, Instant};
-use uuid::{Uuid};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct TextGenerationRequest {
@@ -302,7 +302,6 @@ pub trait TextRequestGenerator: Sync {
     fn callback(&mut self, request: Arc<TextGenerationRequest>, response: &str);
 }
 
-
 #[derive(Deserialize, Serialize, Clone)]
 pub struct Conversation {
     pub role: String,
@@ -365,7 +364,9 @@ impl Ord for ConversationTurnRequest {
     // order by increasing priority and decreasing tie-breaking
     // this way, we can pop the item with the highest priority and oldest tie-breaking
     fn cmp(&self, other: &Self) -> Ordering {
-        self.priority.cmp(&other.priority).then_with(|| self.tie.cmp(&other.tie).reverse())
+        self.priority
+            .cmp(&other.priority)
+            .then_with(|| self.tie.cmp(&other.tie).reverse())
     }
 }
 
@@ -374,7 +375,6 @@ impl PartialOrd for ConversationTurnRequest {
         Some(self.cmp(other))
     }
 }
-
 
 #[derive(Clone)]
 pub struct ConversationTextRequestGenerator {
@@ -415,7 +415,8 @@ impl ConversationTextRequestGenerator {
         let input = std::fs::read_to_string(&filepath)?;
         let data: Vec<ConversationEntry> = serde_json::from_str(&input).expect("Unable to parse input file. Check that it is valid JSON and matches the expected format.");
         // generate requests
-        let requests: Arc<Mutex<HashMap<Uuid, ConversationTurnRequest>>> = Arc::from(Mutex::from(HashMap::new()));
+        let requests: Arc<Mutex<HashMap<Uuid, ConversationTurnRequest>>> =
+            Arc::from(Mutex::from(HashMap::new()));
         info!(
             "Generating requests from {filepath}",
             filepath = filepath.display().to_string()
@@ -430,14 +431,15 @@ impl ConversationTextRequestGenerator {
                 if entry.conversations.is_empty() {
                     continue;
                 }
-                let mut turn_idx = 0;
-                let ids = (0..entry.conversations.len()).map(|_| Uuid::new_v4()).collect::<Vec<Uuid>>();
+                let ids = (0..entry.conversations.len())
+                    .map(|_| Uuid::new_v4())
+                    .collect::<Vec<Uuid>>();
                 let filtered_conversations = entry
                     .conversations
                     .iter()
                     .filter(|c| c.role == "user" || c.role == "system")
                     .collect::<Vec<&Conversation>>();
-                for c in &filtered_conversations {
+                for (turn_idx, c) in filtered_conversations.iter().enumerate() {
                     let prompt = c.content.clone();
                     let num_decode_tokens = decode_tokenize_opts.clone().map_or_else(
                         || None,
@@ -455,7 +457,7 @@ impl ConversationTextRequestGenerator {
                     let next_id = if turn_idx == entry.conversations.len() - 1 {
                         None
                     } else {
-                        Some(ids[turn_idx + 1].clone()) // link to next turn in the conversation
+                        Some(ids[turn_idx + 1]) // link to next turn in the conversation
                     };
                     debug!("Prompt: {prompt}", prompt = prompt);
                     match &prompt_tokenize_opts {
@@ -471,46 +473,48 @@ impl ConversationTextRequestGenerator {
                                     return;
                                 }
                             };
-                            requests.lock().unwrap().insert(ids[turn_idx], ConversationTurnRequest {
-                                id: ids[turn_idx],
-                                priority: turn_idx as u64,
-                                tie: Instant::now(),
-                                request: TextGenerationRequest {
-                                    id: next_id,
-                                    prompt,
-                                    num_prompt_tokens: num_tokens,
-                                    num_decode_tokens,
+                            requests.lock().unwrap().insert(
+                                ids[turn_idx],
+                                ConversationTurnRequest {
+                                    id: ids[turn_idx],
+                                    priority: turn_idx as u64,
+                                    tie: Instant::now(),
+                                    request: TextGenerationRequest {
+                                        id: next_id,
+                                        prompt,
+                                        num_prompt_tokens: num_tokens,
+                                        num_decode_tokens,
+                                    },
                                 },
-                            });
+                            );
                         }
                         Some(options) => {
                             // compute number of tokens to generate using a Gaussian distribution
-                            let (sampled_prompt, prompt_tokens) = match tokenize_prompt(
-                                prompt.clone(),
-                                tokenizer.clone(),
-                                options,
-                            ) {
-                                Ok(prompt) => prompt,
-                                Err(e) => {
-                                    debug!("Error tokenizing prompt: {e}");
-                                    return;
-                                }
-                            };
-                            requests.lock().unwrap().insert(ids[turn_idx], ConversationTurnRequest {
-                                id: ids[turn_idx],
-                                tie: Instant::now(),
-                                priority: turn_idx as u64,
-                                request: TextGenerationRequest {
-                                    id: next_id,
-                                    prompt: sampled_prompt,
-                                    num_prompt_tokens: prompt_tokens,
-                                    num_decode_tokens,
+                            let (sampled_prompt, prompt_tokens) =
+                                match tokenize_prompt(prompt.clone(), tokenizer.clone(), options) {
+                                    Ok(prompt) => prompt,
+                                    Err(e) => {
+                                        debug!("Error tokenizing prompt: {e}");
+                                        return;
+                                    }
+                                };
+                            requests.lock().unwrap().insert(
+                                ids[turn_idx],
+                                ConversationTurnRequest {
+                                    id: ids[turn_idx],
+                                    tie: Instant::now(),
+                                    priority: turn_idx as u64,
+                                    request: TextGenerationRequest {
+                                        id: next_id,
+                                        prompt: sampled_prompt,
+                                        num_prompt_tokens: prompt_tokens,
+                                        num_decode_tokens,
+                                    },
                                 },
-                            });
+                            );
                         }
                     }
-                    turn_idx += 1;
-                };
+                }
                 // TODO: check that we have enough requests
             }
         });
@@ -520,7 +524,13 @@ impl ConversationTextRequestGenerator {
             num_requests = requests.len()
         );
         // create the queue from the hashmap. Only queue first turns in the conversation
-        let queue = BinaryHeap::from(requests.values().cloned().filter(|item| item.priority == 0).collect::<Vec<ConversationTurnRequest>>());
+        let queue = BinaryHeap::from(
+            requests
+                .values()
+                .filter(|item| item.priority == 0)
+                .cloned()
+                .collect::<Vec<ConversationTurnRequest>>(),
+        );
         Ok(Self {
             requests: requests.clone(),
             tokenizer,
@@ -588,22 +598,19 @@ impl TextRequestGenerator for ConversationTextRequestGenerator {
             None => {
                 return;
             }
-            Some(id) => {
-                id
-            }
+            Some(id) => id,
         };
         // retrieve next turn from id
         let next_request = match self.requests.get(&id) {
             None => {
                 return;
             }
-            Some(request) => {
-                request
-            }
+            Some(request) => request,
         };
         // create a new turn with the prompt concatenated with the response and next turn's prompt
         // and add the next turn id to the new turn
-        let new_prompt = request.prompt.clone() + "\n" + response + "\n" + next_request.request.prompt.as_str();
+        let new_prompt =
+            request.prompt.clone() + "\n" + response + "\n" + next_request.request.prompt.as_str();
         // tokenize the prompt
         let (prompt, num_tokens) = match tokenize_prompt(
             new_prompt.to_string(),
@@ -618,7 +625,7 @@ impl TextRequestGenerator for ConversationTextRequestGenerator {
         let next_id = next_request.request.id;
         let turn = ConversationTurnRequest {
             id,
-            priority: 100, // move to the front of the queue
+            priority: 100,       // move to the front of the queue
             tie: Instant::now(), // use the current time as tie-breaking (older turns have higher priority)
             request: TextGenerationRequest {
                 id: next_id,
@@ -827,7 +834,7 @@ mod tests {
             tokenizer,
             time::Duration::from_secs(10),
         )
-            .unwrap();
+        .unwrap();
         let request = TextGenerationRequest {
             id: None,
             prompt: "Hello, world!".to_string(),
@@ -887,7 +894,7 @@ mod tests {
             tokenizer,
             time::Duration::from_secs(10),
         )
-            .unwrap();
+        .unwrap();
         let request = TextGenerationRequest {
             id: None,
             prompt: "Hello, world!".to_string(),
@@ -939,7 +946,7 @@ mod tests {
         assert!(
             inter_token_latency_avg > expected_inter_token_latency_avg
                 && inter_token_latency_avg
-                < expected_inter_token_latency_avg + inter_token_latency_overhead,
+                    < expected_inter_token_latency_avg + inter_token_latency_overhead,
             "inter_token_latency_avg: {:?} < {:?} < {:?}",
             expected_inter_token_latency_avg,
             inter_token_latency_avg,
@@ -972,7 +979,7 @@ mod tests {
             tokenizer,
             time::Duration::from_secs(10),
         )
-            .unwrap();
+        .unwrap();
         let request = TextGenerationRequest {
             id: None,
             prompt: "Hello, world!".to_string(),
@@ -1018,7 +1025,7 @@ mod tests {
             tokenizer,
             time::Duration::from_secs(10),
         )
-            .unwrap();
+        .unwrap();
         let request = TextGenerationRequest {
             id: None,
             prompt: "Hello, world!".to_string(),
@@ -1064,7 +1071,7 @@ mod tests {
             tokenizer,
             time::Duration::from_secs(10),
         )
-            .unwrap();
+        .unwrap();
         let request = TextGenerationRequest {
             id: None,
             prompt: "Hello, world!".to_string(),
@@ -1114,7 +1121,7 @@ mod tests {
             tokenizer,
             Duration::from_secs(1),
         )
-            .unwrap();
+        .unwrap();
         let request = TextGenerationRequest {
             id: None,
             prompt: "Hello, world!".to_string(),
@@ -1154,7 +1161,7 @@ mod tests {
             Some(decode_tokenize_opts),
             hf_token,
         )
-            .unwrap();
+        .unwrap();
         assert_eq!(generator.requests.len(), 17016);
     }
 
@@ -1178,7 +1185,7 @@ mod tests {
             Some(decode_tokenize_opts),
             hf_token,
         )
-            .unwrap();
+        .unwrap();
         let min_tokens = generator
             .requests
             .iter()
@@ -1215,7 +1222,7 @@ mod tests {
             Some(decode_tokenize_opts),
             hf_token,
         )
-            .unwrap();
+        .unwrap();
         for r in generator.requests.iter() {
             assert_eq!(r.1.request.num_prompt_tokens, 200);
         }
@@ -1242,8 +1249,12 @@ mod tests {
             Some(decode_tokenize_opts),
             hf_token,
         )
-            .unwrap();
-        let turns = generator.requests.into_iter().map(|r| r.1.clone()).collect::<Vec<ConversationTurnRequest>>();
+        .unwrap();
+        let turns = generator
+            .requests
+            .into_iter()
+            .map(|r| r.1.clone())
+            .collect::<Vec<ConversationTurnRequest>>();
         assert_eq!(turns.len(), 8);
         let first_turns = turns.clone().into_iter().filter(|t| t.priority == 0);
         // we expect to have 2 None values for the first turn in each conversation
@@ -1254,13 +1265,20 @@ mod tests {
         let mut current_turn = first_conversation[0].clone();
         loop {
             conversation.push(current_turn.clone());
-            match turns.iter().find(|t| t.id == current_turn.request.id.unwrap_or_default()) {
+            match turns
+                .iter()
+                .find(|t| t.id == current_turn.request.id.unwrap_or_default())
+            {
                 Some(t) => current_turn = t.clone(),
                 None => break,
             }
         }
         assert_eq!(conversation.len(), 6);
-        let got = conversation.iter().map(|t| t.request.prompt.clone()).collect::<Vec<String>>().join("\n");
+        let got = conversation
+            .iter()
+            .map(|t| t.request.prompt.clone())
+            .collect::<Vec<String>>()
+            .join("\n");
         let expect = "Summarize the main ideas of Jeff Walker's Product Launch Formula into bullet points as it pertains to a growth marketing agency implementing these strategies and tactics for their clients...\nSummarize the main ideas of Brendon Burchard's Experts Academy into bullet points as it pertains to a growth marketing agency implementing these strategies and tactics for their clients...\nWhat are the mental triggers in Jeff Walker's Product Launch Formula and \"Launch\" book?\nWrite a summary of why scarcity and urgency are the strongest mental triggers and have been the driving force behind many of our best performing campaigns over the last 8 years.\nSummarize Russell Brunson's Perfect Webinar Script...\nSummarize the 6 human needs as Tony Robbins explains...";
         assert_eq!(expect, got);
     }
@@ -1285,13 +1303,15 @@ mod tests {
             Some(decode_tokenize_opts),
             hf_token,
         )
-            .unwrap();
+        .unwrap();
         for i in 0..20 {
             let req = generator.generate_request();
-            if i % 2 == 0 { // first turn of the first conversation
+            if i % 2 == 0 {
+                // first turn of the first conversation
                 assert_eq!(req.prompt, "Summarize the main ideas of Jeff Walker's Product Launch Formula into bullet points as it pertains to a growth marketing agency implementing these strategies and tactics for their clients...");
             }
-            if i % 2 == 1 { // first turn of the second conversation
+            if i % 2 == 1 {
+                // first turn of the second conversation
                 assert_eq!(req.prompt, "You are a helpful assistant.");
             }
         }
@@ -1317,7 +1337,7 @@ mod tests {
             Some(decode_tokenize_opts),
             hf_token,
         )
-            .unwrap();
+        .unwrap();
         // generate the first user turn
         let req = generator.generate_request();
         let response = "This is my response".to_string();
@@ -1338,4 +1358,3 @@ mod tests {
         assert_eq!(req.prompt, "You are a helpful assistant.");
     }
 }
-

@@ -187,8 +187,8 @@ fn parse_tokenizer_options(s: &str) -> Result<TokenizeOptions, Error> {
     }
     if tokenizer_options.num_tokens.is_some()
         && (tokenizer_options.num_tokens.unwrap() == 0
-        || tokenizer_options.min_tokens == 0
-        || tokenizer_options.max_tokens == 0)
+            || tokenizer_options.min_tokens == 0
+            || tokenizer_options.max_tokens == 0)
     {
         return Err(Error::new(InvalidValue));
     }
