@@ -17,14 +17,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  Rust checks:
+  rust:
+    name: Rust checks
     permissions:
       pull-requests: write
       contents: read
     uses: ./.github/workflows/rust.yaml
-  Build Docker image:
+  build:
     permissions:
       packages: write
       contents: read
+    name: Build and push docker image
     uses: ./.github/workflows/build.yaml
     needs: rust
