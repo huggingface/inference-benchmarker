@@ -18,6 +18,7 @@ It can be used to benchmark any text generation server that exposes an OpenAI-co
 * Broad Compatibility: Benchmarks any text generation server with an OpenAPI-compliant chat API.
 * Automatic Sweep Mode: Detects maximum throughput and sweeps in-between.
 * Open-Loop Benchmarking: Uses constant arrival rates to simulate real-world workloads.
+* Benchmark profiles: Presets to benchmark for different model use cases (eg. chat, summarization, code completion...).
 * High-Performance: Built with Rust 🦀 for high-performance benchmarking.
 * JSON Output: Delivers performance results in a structured, easy-to-analyze format.
 
@@ -34,6 +35,7 @@ It can be used to benchmark any text generation server that exposes an OpenAI-co
       * [1. Start an inference server](#1-start-an-inference-server)
       * [2. Run a benchmark using Docker image](#2-run-a-benchmark-using-docker-image)
     * [Configure your benchmark](#configure-your-benchmark)
+      * [Profiles](#profiles)
       * [Benchmark mode](#benchmark-mode)
       * [Dataset configuration](#dataset-configuration)
       * [Prompt configuration](#prompt-configuration)
@@ -79,6 +81,7 @@ docker run --runtime nvidia --gpus all \
 ```shell
 MODEL=meta-llama/Llama-3.1-8B-Instruct
 HF_TOKEN=<your HF READ token>
+# run a benchmark to evaluate the performance of the model for chat use case
 # we mount results to the current directory
 $ docker run \
     --rm \
@@ -89,17 +92,31 @@ $ docker run \
     ghcr.io/huggingface/inference-benchmarker:latest \
     inference-benchmarker \
     --tokenizer-name "$MODEL" \
-    --max-vus 800 \
     --url http://localhost:8080 \
-    --warmup 20s \
-    --num-rates 10 \
-    --prompt-options "num_tokens=200,max_tokens=220,min_tokens=180,variance=10" \
-    --decode-options "num_tokens=200,max_tokens=220,min_tokens=180,variance=10" 
+    --profile chat
 ```
 
 Results will be saved in JSON format in current directory.
 
 ### Configure your benchmark
+
+#### Profiles
+
+Profiles are presets to benchmark for different model use cases. Available profiles:
+- `chat`
+  Simulates a multi-turn chat scenario in which the model answers to successive user prompts.
+  The model is prompted with the whole conversation history at each turn. Prefix caching will have a significant impact
+  on the performance of this benchmark.
+- `code-generation`
+  Simulates code-complete scenarios. Model is given large code snippets and asked to complete them with a few tokens 
+  (e.g. a function name, a few code lines).
+- `classification`
+  Simulates cases where the model is fed with large chunks of business data or document repeatedly and users
+  ask simple questions about the content (summarization, classification...).
+  Those use cases benefit a lot from prefix caching and chunked prefill.
+- `fixed-length`
+  Model is sent fixed-length prompts to void the impact of variable-length tokenization on the benchmark.
+  This is a technical benchmark to evaluate the raw throughput of the model.
 
 #### Benchmark mode
 
