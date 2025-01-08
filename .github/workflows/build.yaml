@@ -3,7 +3,7 @@ name: Build and push docker image to internal registry
 on:
   workflow_call:
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-build
   cancel-in-progress: true
 jobs:
   build-and-push:
