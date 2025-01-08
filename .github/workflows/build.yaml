@@ -37,7 +37,7 @@ jobs:
           images: |
             ghcr.io/huggingface/inference-benchmarker
           tags: |
-            type=raw,value=sha-${{ env.GITHUB_SHA_SHORT }}${{ env.LABEL }}
+            type=raw,value=sha-${{ env.GITHUB_SHA_SHORT }}
       # If main, release or tag
       - name: Extract metadata (tags, labels) for Docker
         if: ${{ github.event_name != 'pull_request' }}
@@ -49,10 +49,10 @@ jobs:
           images: |
             ghcr.io/huggingface/inference-benchmarker
           tags: |
-            type=semver,pattern={{version}}${{ env.LABEL }}
-            type=semver,pattern={{major}}.{{minor}}${{ env.LABEL }}
-            type=raw,value=latest${{ env.LABEL }},enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
-            type=raw,value=sha-${{ env.GITHUB_SHA_SHORT }}${{ env.LABEL }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+            type=raw,value=sha-${{ env.GITHUB_SHA_SHORT }}
       - name: Build and push Docker image
         id: build-and-push
         uses: docker/build-push-action@v4
@@ -63,7 +63,7 @@ jobs:
           platforms: 'linux/amd64'
           build-args: |
             GIT_SHA=${{ env.GITHUB_SHA }}
-            DOCKER_LABEL=sha-${{ env.GITHUB_SHA_SHORT }}${{ env.LABEL }}
+            DOCKER_LABEL=sha-${{ env.GITHUB_SHA_SHORT }}
             PLATFORM=${{ env.PLATFORM }}
           tags: ${{ steps.meta.outputs.tags || steps.meta-pr.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels || steps.meta-pr.outputs.labels }}
