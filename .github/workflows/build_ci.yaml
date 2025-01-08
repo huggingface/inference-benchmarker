@@ -1,0 +1,21 @@
+name: Build inference-benchmarker
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  push:
+    branches:
+      - 'main'
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - "main"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  - use: ./.github/workflows/rust.yaml
+  - use: ./.github/workflows/build.yaml

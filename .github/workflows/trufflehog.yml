@@ -1,7 +1,7 @@
+name: Secret Leaks
+
 on:
   push:
-
-name: Secret Leaks
 
 jobs:
   trufflehog:

@@ -1,16 +1,8 @@
-on:
-  workflow_dispatch:
-  push:
-    branches:
-      - 'main'
-    tags:
-      - 'v*'
-  pull_request:
-    paths:
-      - 'src/**'
-      - .github/workflows/rust.yml
-
 name: Rust checks
+
+on:
+  workflow_call:
+
 permissions:
   pull-requests: write
   contents: read
