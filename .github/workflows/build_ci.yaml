@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   rust:
-    use: ./.github/workflows/rust.yaml
+    uses: ./.github/workflows/rust.yaml
   build:
-    use: ./.github/workflows/build.yaml
+    uses: ./.github/workflows/build.yaml
     needs: rust
