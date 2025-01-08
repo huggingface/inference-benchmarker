@@ -17,5 +17,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  - use: ./.github/workflows/rust.yaml
-  - use: ./.github/workflows/build.yaml
+  rust:
+    use: ./.github/workflows/rust.yaml
+  build:
+    use: ./.github/workflows/build.yaml
+    needs: rust
