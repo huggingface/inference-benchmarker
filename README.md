@@ -230,7 +230,7 @@ Slurm example is provided in `extra/slurm`.
 ## Visualize the results
 
 You can use the provided Gradio app to quickly visualize the results.
-Considering that JSON results are in `/path/to/results/dir`:
+Considering that JSON results files are in `/path/to/results/dir`:
 ```shell
 $ poetry install
 $ cd extra/dashboard
