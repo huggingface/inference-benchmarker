@@ -32,14 +32,6 @@ def run(from_results_dir, datasource, port):
     ## Summary
     This table shows the average of the metrics for each model and QPS rate.
     
-    Benchmark are run with:
-    - Prompts: 200±10 tokens length (normal distribution)
-    - Generation: 800 max tokens length
-    - 120s duration 
-    
-    Each benchmark is run using a constant arrival rate of requests per second (QPS), 
-    independently of the number of requests that are being processed (open loop).
-    
     The metrics are:
     * Inter token latency: Time to generate a new output token for each user querying the system. 
       It translates as the “speed” perceived by the end-user. We aim for at least 300 words per minute (average reading speed), so ITL<150ms
@@ -49,9 +41,7 @@ def run(from_results_dir, datasource, port):
     * Throughput: The number of tokens per second the system can generate across all requests
     * Successful requests: The number of requests the system was able to honor in the benchmark timeframe
     * Error rate: The percentage of requests that ended up in error, as the system could not process them in time or failed to process them. 
-      
-    ⚠️ TGI has a rate-limiting mechanism that will throttle requests, so a high error rate can be a sign of rate limit hit.
-    
+          
     '''
 
     df_bench = pd.DataFrame()
@@ -164,7 +154,9 @@ def run(from_results_dir, datasource, port):
     percentiles.append('avg')
     with gr.Blocks(css=css, title="Inference Benchmarker") as demo:
         with gr.Row():
-            header = gr.Markdown("# Inference-benchmarker 🤗\nBenchmark results")
+            gr.Markdown("# Inference-benchmarker 🤗\n## Benchmarks results")
+        with gr.Row():
+            gr.Markdown(summary_desc)
         with gr.Row():
             table = gr.DataFrame(
                 pd.DataFrame(),
