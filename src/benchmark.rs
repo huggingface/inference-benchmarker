@@ -443,6 +443,7 @@ mod tests {
                 model_name: "gpt2".to_string(),
                 profile: None,
                 extra_metadata: None,
+                run_id: "test".to_string(),
             },
             backend,
             requests_generator,
