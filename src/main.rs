@@ -105,6 +105,10 @@ struct Args {
     /// Example: --extra-meta "key1=value1,key2=value2"
     #[clap(long, env, value_parser(parse_key_val))]
     extra_meta: Option<HashMap<String, String>>,
+    // A run identifier to use for the benchmark. This is used to identify the benchmark in the
+    // results file.
+    #[clap(long, env)]
+    run_id: Option<String>,
 }
 
 fn parse_duration(s: &str) -> Result<Duration, Error> {
@@ -202,6 +206,9 @@ async fn main() {
         .model_name
         .clone()
         .unwrap_or(args.tokenizer_name.clone());
+    let run_id = args
+        .run_id
+        .unwrap_or(uuid::Uuid::new_v4().to_string()[..7].to_string());
     let run_config = RunConfiguration {
         url: args.url.clone(),
         profile: args.profile.clone(),
@@ -217,9 +224,10 @@ async fn main() {
         decode_options: args.decode_options.clone(),
         dataset: args.dataset.clone(),
         dataset_file: args.dataset_file.clone(),
-        hf_token,
         extra_metadata: args.extra_meta.clone(),
+        hf_token,
         model_name,
+        run_id,
     };
     let main_thread = tokio::spawn(async move {
         match run(run_config, stop_sender_clone).await {

@@ -19,7 +19,7 @@ class PlotConfig:
     percentiles: List[float] = None
 
 
-def run(from_results_dir, datasource_bench, datasource_ci, github_token, github_repo, port):
+def run(from_results_dir, datasource, port):
     css = '''
     .summary span {
         font-size: 10px;
@@ -55,54 +55,36 @@ def run(from_results_dir, datasource_bench, datasource_ci, github_token, github_
     '''
 
     df_bench = pd.DataFrame()
-    df_ci = pd.DataFrame()
-    summary = pd.DataFrame()
     line_plots_bench = []
-    line_plots_ci = []
     column_mappings = {'inter_token_latency_ms_p90': 'ITL P90 (ms)', 'time_to_first_token_ms_p90': 'TTFT P90 (ms)',
                        'e2e_latency_ms_p90': 'E2E P90 (ms)', 'token_throughput_secs': 'Throughput (tokens/s)',
                        'successful_requests': 'Successful requests', 'error_rate': 'Error rate (%)', 'model': 'Model',
-                       'rate': 'QPS'}
+                       'rate': 'QPS', 'run_id': 'Run ID'}
     default_df = pd.DataFrame.from_dict(
-        {"rate": [1, 2], "inter_token_latency_ms_p90": [10, 20], "engine": ["default", "default"],
+        {"rate": [1, 2], "inter_token_latency_ms_p90": [10, 20],
          "version": ["default", "default"],
-         "model": ["default", "default"], "device": ["default", "default"]})
+         "model": ["default", "default"]})
 
-    def load_demo(device_bench, model_bench, percentiles, device_ci, model_ci, percentiles_ci, commit_ref,
-                  commit_compare):
-        return update_bench(device_bench, model_bench, percentiles) + update_ci(device_ci, model_ci, percentiles_ci,
-                                                                                commit_ref,
-                                                                                commit_compare)
+    def load_demo(model_bench, percentiles):
+        return update_bench(model_bench, percentiles)
 
-    def update_bench(device_bench, model, percentiles):
+    def update_bench(model, percentiles):
         res = []
         for plot in line_plots_bench:
             if plot['config'].percentiles:
                 k = plot['metric'] + '_' + str(percentiles)
                 df_bench[plot['metric']] = df_bench[k] if k in df_bench.columns else 0
-            res.append(df_bench[(df_bench['model'] == model) & (df_bench['device'] == device_bench)])
+            res.append(df_bench[(df_bench['model'] == model)])
 
-        return res + [summary_table(device_bench)]
+        return res + [summary_table()]
 
-    def update_ci(device_ci, model_ci, percentiles_ci, commit_ref, commit_compare):
-        res = []
-        for plot in line_plots_ci:
-            if plot['config'].percentiles:
-                k = plot['metric'] + '_' + str(percentiles_ci)
-                df_ci[plot['metric']] = df_ci[k] if k in df_ci.columns else 0
-            res.append(df_ci[(df_ci['model'] == model_ci) & (df_ci['device'] == device_ci) & (
-                    (df_ci['version'] == commit_ref) | (df_ci['version'] == commit_compare))])
-        return res + [compare_table(device_ci, commit_ref, commit_compare)]
-
-    def summary_table(device) -> pd.DataFrame:
-        rates = [4., 12., 20., 24.]
-        data = df_bench[(df_bench['device'] == device) & (df_bench['rate'].isin(rates))]
-        data = data.groupby(['model', 'rate', 'engine']).agg(
+    def summary_table() -> pd.DataFrame:
+        data = df_bench.groupby(['model', 'run_id','rate']).agg(
             {'inter_token_latency_ms_p90': 'mean', 'time_to_first_token_ms_p90': 'mean',
              'e2e_latency_ms_p90': 'mean', 'token_throughput_secs': 'mean',
              'successful_requests': 'mean', 'error_rate': 'mean'}).reset_index()
         data = data[
-            ['model', 'engine', 'rate', 'inter_token_latency_ms_p90', 'time_to_first_token_ms_p90',
+            ['run_id', 'model', 'rate', 'inter_token_latency_ms_p90', 'time_to_first_token_ms_p90',
              'e2e_latency_ms_p90',
              'token_throughput_secs']]
         for metric in ['inter_token_latency_ms_p90', 'time_to_first_token_ms_p90', 'e2e_latency_ms_p90',
@@ -112,41 +94,17 @@ def run(from_results_dir, datasource_bench, datasource_ci, github_token, github_
             columns=column_mappings)
         return data
 
-    def compare_table(device, commit_ref, commit_compare) -> pd.DataFrame:
-        rates = [4., 8., 16.]
-        metrics = ['inter_token_latency_ms_p90', 'time_to_first_token_ms_p90', 'e2e_latency_ms_p90',
-                   'token_throughput_secs']
-        data = df_ci[(df_ci['device'] == device) & (df_ci['rate'].isin(rates))]
-        ref = data[(data['device'] == device) & (data['version'] == commit_ref) & (data['engine'] == 'TGI')]
-        compare = data[(data['device'] == device) & (data['version'] == commit_compare) & (data['engine'] == 'TGI')]
-        data = ref.merge(compare, on=['model', 'rate'], suffixes=('_ref', '_compare'))
-        data = data.rename(
-            columns=column_mappings)
-        for metric in metrics:
-            name = column_mappings[metric]
-            data[f'∆ {name}'] = (data[f'{metric}_compare'] - data[f'{metric}_ref']) / data[f'{metric}_ref'] * 100.0
-            data[f'∆ {name}'] = data[f'∆ {name}'].apply(lambda x: f"{x:.2f}%")
-        data = data[['Model', 'QPS'] + [f'∆ {column_mappings[metric]}' for metric in metrics]]
-
-        return data
-
     def load_bench_results(source) -> pd.DataFrame:
         data = pd.read_parquet(source)
         # remove warmup and throughput
         data = data[(data['id'] != 'warmup') & (data['id'] != 'throughput')]
         # only keep constant rate
         data = data[data['executor_type'] == 'ConstantArrivalRate']
-        # sanity check: we should have only one version per engine
-        # assert data.groupby(['engine', 'version']).size().reset_index().shape[0] == 2
         return data
 
-    def load_ci_results(source) -> pd.DataFrame:
-        data = pd.read_parquet(source)
-        return data
-
-    def select_region(selection: gr.SelectData, device, model):
+    def select_region(selection: gr.SelectData, model):
         min_w, max_w = selection.index
-        data = df_bench[(df_bench['model'] == model) & (df_bench['device'] == device) & (df_bench['rate'] >= min_w) & (
+        data = df_bench[(df_bench['model'] == model) & (df_bench['rate'] >= min_w) & (
                 df_bench['rate'] <= max_w)]
         res = []
         for plot in line_plots_bench:
@@ -171,52 +129,10 @@ def run(from_results_dir, datasource_bench, datasource_ci, github_token, github_
         else:
             raise ValueError(f"Unknown datasource: {datasource}")
 
-    def add_github_info(df: pd.DataFrame, repo: str, token: str) -> pd.DataFrame:
-        versions = df['version'].unique()
-        auth = Auth.Token(token)
-        g = Github(auth=auth)
-        repo = g.get_repo(repo)
-        # retrieve all tags
-        tags = repo.get_tags()
-        for version in versions:
-            # retrieve commit from github
-            c = repo.get_commit(version)
-            df.loc[df['version'] == version, 'commit_message'] = c.commit.message
-            df.loc[df['version'] == version, 'commit_date'] = c.commit.author.date
-            df.loc[df['version'] == version, 'commit_tag'] = tags[version].name if version in tags else None
-        return df
-
-    def build_commit_list(df: pd.DataFrame) -> List[Tuple[str, str]]:
-        commits = df['version'].unique()
-        l = []
-        if 'commit_date' in df.columns:
-            df = df.sort_values(by='commit_date', ascending=True, inplace=False)
-        for commit in commits:
-            short_commit = commit[:7]
-            commit_tag = df[df['version'] == commit].get('commit_tag')
-            tag = commit_tag.values[0] if commit_tag is not None else None
-            commit_message = df[df['version'] == commit].get('commit_message')
-            message = commit_message.values[0] if commit_message is not None else None
-            if 'commit_tag' in df.columns and tag is not None:
-                l.append((tag, commit))
-            elif 'commit_message' in df.columns and message is not None:
-                l.append((f'{short_commit} - {message}', commit))
-            else:
-                l.append((short_commit, commit))
-        return l
-
     if from_results_dir is not None:
         build_results(from_results_dir, 'benchmarks.parquet', None)
     # Load data
-    df_bench = load_datasource(datasource_bench, load_bench_results)
-    ci_enabled = True
-    try:
-        df_ci = load_datasource(datasource_ci, load_ci_results)
-    except:
-        df_ci = df_bench
-        ci_enabled = False
-    if github_token and github_repo and ci_enabled:
-        df_ci = add_github_info(df_ci, "huggingface/text-generation-inference", github_token)
+    df_bench = load_datasource(datasource, load_bench_results)
 
     # Define metrics
     metrics = {
@@ -236,21 +152,10 @@ def run(from_results_dir, datasource_bench, datasource_ci, github_token, github_
     }
 
     models = df_bench["model"].unique()
-    models_ci = df_ci["model"].unique()
+    run_ids = df_bench["run_id"].unique()
 
-    devices_bench = df_bench["device"].unique()
-    devices_ci = df_ci["device"].unique()
-
-    commits = df_ci[df_ci["engine"] == "TGI"]["version"].unique()
-    colors = ['#640D5F', '#D91656', '#EE66A6', '#FFEB55']
-    colormap = {}
-    for idx, engine in enumerate(df_bench['engine'].unique()):
-        colormap[engine] = colors[idx % len(colors)]
-    colormap['vLLM'] = '#2F5BA1'
-    colormap['TGI'] = '#FF9D00'
     # get all available percentiles
     percentiles = set()
-    avg = False
     for k, v in metrics.items():
         if v.percentiles:
             percentiles.update(v.percentiles)
@@ -259,111 +164,55 @@ def run(from_results_dir, datasource_bench, datasource_ci, github_token, github_
     percentiles.append('avg')
     with gr.Blocks(css=css, title="Inference Benchmarker") as demo:
         with gr.Row():
-            header = gr.Markdown("# TGI benchmarks\nBenchmark results for Hugging Face TGI 🤗")
-        with gr.Tab(label="TGI benchmarks"):
-            with gr.Row():
-                device_bench = gr.Radio(devices_bench, label="Select device", value=devices_bench[0])
-            with gr.Row():
-                summary_desc = gr.Markdown(summary_desc)
-                versions = df_bench.groupby(['engine', 'version']).size().reset_index()
-            with gr.Row():
-                versions_md = "**Versions**\n"
-                for engine in versions['engine'].unique():
-                    versions_md += f"* **{engine}**: {versions[versions['engine'] == engine]['version'].values[0]}\n"
-                versions_desc = gr.Markdown(versions_md)
-            with gr.Row():
-                table = gr.DataFrame(
-                    pd.DataFrame(),
-                    elem_classes=["summary"],
+            header = gr.Markdown("# Inference-benchmarker 🤗\nBenchmark results")
+        with gr.Row():
+            table = gr.DataFrame(
+                pd.DataFrame(),
+                elem_classes=["summary"],
+            )
+        with gr.Row():
+            details_desc = gr.Markdown("## Details")
+        with gr.Row():
+            model = gr.Dropdown(list(models), label="Select model", value=models[0])
+        with gr.Row():
+            percentiles_bench = gr.Radio(percentiles, label="", value="avg")
+        i = 0
+        with ExitStack() as stack:
+            for k, v in metrics.items():
+                if i % 2 == 0:
+                    stack.close()
+                    gs = stack.enter_context(gr.Row())
+                line_plots_bench.append(
+                    {"component": gr.LinePlot(default_df, label=f'{v.title}', x="rate", y=k,
+                                              y_title=v.y_title, x_title=v.x_title,
+                                              color="run_id"
+                                              ),
+                     "model": model.value,
+                     "metric": k,
+                     "config": v
+                     },
                 )
-            with gr.Row():
-                details_desc = gr.Markdown("## Details")
-            with gr.Row():
-                model = gr.Dropdown(list(models), label="Select model", value=models[0])
-            with gr.Row():
-                percentiles_bench = gr.Radio(percentiles, label="", value="avg")
-            i = 0
-            with ExitStack() as stack:
-                for k, v in metrics.items():
-                    if i % 2 == 0:
-                        stack.close()
-                        gs = stack.enter_context(gr.Row())
-                    line_plots_bench.append(
-                        {"component": gr.LinePlot(default_df, label=f'{v.title}', x="rate", y=k,
-                                                  color="engine", y_title=v.y_title, x_title=v.x_title,
-                                                  color_map=colormap),
-                         "model": model.value,
-                         "device": device_bench,
-                         "metric": k,
-                         "config": v
-                         },
-                    )
-                    i += 1
-        with gr.Tab(label="CI results") as ci_tab:
-            if not ci_enabled:
-                ci_tab.visible = False
-            with gr.Row():
-                header = gr.Markdown("# CI results\nSummary of the benchmarks")
-            with gr.Row():
-                device_ci = gr.Radio(list(devices_ci), label="Select device", value=devices_ci[0])
-            with gr.Row():
-                commit_list = build_commit_list(df_ci)
-                commit_ref = gr.Dropdown(commit_list, label="Reference commit", value=commit_list[0][1])
-                commit_compare = gr.Dropdown(commit_list, label="Commit to compare",
-                                             value=commit_list[1][1] if len(commit_list) > 1 else commit_list[0][1])
-            with gr.Row():
-                comparison_table = gr.DataFrame(
-                    pd.DataFrame(),
-                    elem_classes=["summary"],
-                )
-            with gr.Row():
-                model_ci = gr.Dropdown(list(models_ci), label="Select model", value=models_ci[0])
-            with gr.Row():
-                percentiles_ci = gr.Radio(percentiles, label="", value="avg")
-            i = 0
-            with ExitStack() as stack:
-                for k, v in metrics.items():
-                    if i % 2 == 0:
-                        stack.close()
-                        gs = stack.enter_context(gr.Row())
-                    line_plots_ci.append(
-                        {"component": gr.LinePlot(default_df, label=f'{v.title}', x="rate", y=k,
-                                                  color="version", y_title=v.y_title, x_title=v.x_title),
-                         "model": model_ci.value,
-                         "device": device_ci,
-                         "metric": k,
-                         "config": v
-                         },
-                    )
-                    i += 1
+                i += 1
 
-        for component in [device_bench, model, percentiles_bench]:
-            component.change(update_bench, [device_bench, model, percentiles_bench],
+        for component in [model, percentiles_bench]:
+            component.change(update_bench, [model, percentiles_bench],
                              [item["component"] for item in line_plots_bench] + [table])
-        for component in [device_ci, model_ci, percentiles_ci, commit_ref, commit_compare]:
-            component.change(update_ci, [device_ci, model_ci, percentiles_ci, commit_ref, commit_compare],
-                             [item["component"] for item in line_plots_ci] + [comparison_table])
-        gr.on([plot["component"].select for plot in line_plots_bench], select_region, [device_bench, model],
+        gr.on([plot["component"].select for plot in line_plots_bench], select_region, [model],
               outputs=[item["component"] for item in line_plots_bench])
         gr.on([plot["component"].double_click for plot in line_plots_bench], reset_region, None,
               outputs=[item["component"] for item in line_plots_bench])
-        demo.load(load_demo, [device_bench, model, percentiles_bench, device_ci, model_ci, percentiles_ci, commit_ref,
-                              commit_compare],
-                  [item["component"] for item in line_plots_bench] + [table] + [item["component"] for item in
-                                                                                line_plots_ci] + [comparison_table])
+        demo.load(load_demo, [model, percentiles_bench],
+                  [item["component"] for item in line_plots_bench] + [table])
 
     demo.launch(server_port=port)
 
 
 @click.command()
-@click.option('--from-results-dir', default=None, help='Load results from a directory')
-@click.option('--datasource-bench', default='file://benchmarks.parquet', help='Benchmarks datasource')
-@click.option('--datasource-ci', default='file://ci.parquet', help='CI datasource')
-@click.option('--github-token', default=None, help='Github token')
-@click.option('--github-repo', default=None, help='Github repo')
+@click.option('--from-results-dir', default=None, help='Load inference-benchmarker results from a directory')
+@click.option('--datasource', default='file://benchmarks.parquet', help='Load a Parquet file already generated')
 @click.option('--port', default=7860, help='Port to run the dashboard')
-def main(from_results_dir, datasource_bench, datasource_ci, github_token, github_repo, port):
-    run(from_results_dir, datasource_bench, datasource_ci, github_token, github_repo, port)
+def main(from_results_dir, datasource, port):
+    run(from_results_dir, datasource, port)
 
 
 if __name__ == '__main__':

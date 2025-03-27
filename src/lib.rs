@@ -49,6 +49,7 @@ pub struct RunConfiguration {
     pub hf_token: Option<String>,
     pub extra_metadata: Option<HashMap<String, String>>,
     pub model_name: String,
+    pub run_id: String,
 }
 
 pub async fn run(mut run_config: RunConfiguration, stop_sender: Sender<()>) -> anyhow::Result<()> {
@@ -105,8 +106,10 @@ pub async fn run(mut run_config: RunConfiguration, stop_sender: Sender<()>) -> a
         prompt_options: run_config.prompt_options.clone(),
         decode_options: run_config.decode_options.clone(),
         tokenizer: run_config.tokenizer_name.clone(),
+        model_name: run_config.model_name.clone(),
         profile: run_config.profile.clone(),
         extra_metadata: run_config.extra_metadata.clone(),
+        run_id: run_config.run_id.clone(),
     };
     config.validate()?;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

@@ -71,9 +71,11 @@ pub struct BenchmarkConfig {
     pub prompt_options: Option<TokenizeOptions>,
     pub decode_options: Option<TokenizeOptions>,
     pub tokenizer: String,
+    pub model_name: String,
     pub profile: Option<String>,
     #[serde(rename = "meta")]
     pub extra_metadata: Option<HashMap<String, String>>,
+    pub run_id: String,
 }
 
 impl BenchmarkConfig {
@@ -438,6 +440,7 @@ mod tests {
                 prompt_options: None,
                 decode_options: None,
                 tokenizer: "gpt2".to_string(),
+                model_name: "gpt2".to_string(),
                 profile: None,
                 extra_metadata: None,
             },

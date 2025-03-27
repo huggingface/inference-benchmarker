@@ -11,6 +11,8 @@ def build_df(model: str, data_files: dict[str, str]) -> pd.DataFrame:
     for key, filename in data_files.items():
         with open(filename, 'r') as f:
             data = json.load(f)
+            if data['config']['meta'] is None:
+                data['config']['meta'] = {}
             for result in data['results']:
                 entry = pd.json_normalize(result).to_dict(orient='records')[0]
                 if 'engine' in data['config']['meta']:
@@ -21,7 +23,8 @@ def build_df(model: str, data_files: dict[str, str]) -> pd.DataFrame:
                     entry['version'] = data['config']['meta']['version']
                 if 'device' in data['config']['meta']:
                     entry['device'] = data['config']['meta']['device']
-                entry['model'] = data['config']['tokenizer']
+                entry['model'] = data['config']['model_name']
+                entry['run_id'] = data['config']['run_id']
                 df_tmp = pd.DataFrame(entry, index=[0])
                 # rename columns that start with 'config.'
                 df_tmp = df_tmp.rename(columns={c: c.split('config.')[-1] for c in df_tmp.columns})
@@ -35,7 +38,7 @@ def build_df(model: str, data_files: dict[str, str]) -> pd.DataFrame:
 def build_results_df(results_dir) -> pd.DataFrame:
     df = pd.DataFrame()
     # list directories
-    directories = [f'{results_dir}/{d}' for d in os.listdir(results_dir) if os.path.isdir(f'{results_dir}/{d}')]
+    directories = [f'{results_dir}/{d}' for d in os.listdir(results_dir) if os.path.isdir(f'{results_dir}/{d}')] + [results_dir]
     for directory in directories:
         # list json files in results directory
         data_files = {}
