@@ -423,7 +423,7 @@ impl ConversationTextRequestGenerator {
             Arc::from(Mutex::from(HashMap::new()));
         info!(
             "Generating requests from {filepath}",
-            filepath = filepath.display().to_string()
+            filepath = filepath.display()
         );
         let bar = ProgressBar::new(data.len() as u64);
         bar.set_style(ProgressStyle::with_template(
