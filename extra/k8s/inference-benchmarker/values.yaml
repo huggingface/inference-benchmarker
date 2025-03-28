@@ -1,5 +1,3 @@
-
-
 imagePullSecrets: [ ]
 nameOverride: ""
 fullnameOverride: ""
@@ -50,14 +48,9 @@ vllm:
 
 benchmark:
   extra_args:
-    - "--max-vus"
+    - "--profile"
+    - "chat"
     - "800"
-    - "--duration"
-    - "120s"
-    - "--warmup"
-    - "30s"
-    - "--benchmark-kind"
-    - "sweep"
   image:
     repository: ghcr.io/huggingface/inference-benchmarker
     pullPolicy: IfNotPresent

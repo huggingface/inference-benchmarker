@@ -60,7 +60,7 @@ MODEL=meta-llama/Llama-3.1-8B-Instruct
 HF_TOKEN=<your HF READ token>
 
 docker run --gpus all --shm-size 1g -p 8080:80 -e "HF_TOKEN=$HF_TOKEN" \
-    ghcr.io/huggingface/text-generation-inference:2.3.1 --model-id $MODEL
+    ghcr.io/huggingface/text-generation-inference:3.2.1 --model-id $MODEL
 ```
 
 **vLLM**

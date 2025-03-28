@@ -64,16 +64,15 @@ if [[ $exit_code != 124 ]]; then
          --no-container-mount-home \
          inference-benchmarker \
              --tokenizer-name "$MODEL" \
-             --max-vus 800 \
+             --max-vus 128 \
              --url "http://${SLURM_JOB_NODELIST_HET_GROUP_0}:${PORT}" \
              --duration 120s \
              --warmup 30s \
              --benchmark-kind rate \
              --rates 0.8 --rates 2.4 --rates 4.0 --rates 5.6 --rates 7.2 --rates 8.8 --rates 10.4 --rates 12.0 --rates 13.6 --rates 15.2 --rates 16.8 --rates 18.4 --rates 20.0 --rates 21.6 --rates 23.2 --rates 24.0 \
              --extra-meta "version=$VERSION,engine=vLLM,tp=$TP,max_num_batched_tokens=512" \
-             --prompt-options "num_tokens=200,max_tokens=220,min_tokens=180,variance=10" \
-             --decode-options "num_tokens=800,max_tokens=800,min_tokens=800,variance=0" \
-             --dataset-file share_gpt_cleaned.json \
+             --decode-options "num_tokens=800,max_tokens=800,min_tokens=50,variance=100" \
+             --dataset-file share_gpt_turns.json \
              --no-console
 fi
 
