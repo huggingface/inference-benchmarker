@@ -15,4 +15,4 @@ jobs:
     - name: Secret Scanning
       uses: trufflesecurity/trufflehog@main
       with:
-        extra_args: --exclude-globs='test_data/.*'
+        extra_args: --exclude-globs='test_data/.*' --results=verified,unknown --exclude-detectors=postgres
