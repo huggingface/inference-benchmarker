@@ -556,7 +556,7 @@ impl ConversationTextRequestGenerator {
 
 fn sample_num_tokens(num_tokens: u64, min_tokens: u64, max_tokens: u64, variance: u64) -> u64 {
     let normal = rand_distr::Normal::new(num_tokens as f64, variance as f64).unwrap();
-    let mut num_tokens = normal.sample(&mut rand::thread_rng()) as u64;
+    let mut num_tokens = normal.sample(&mut rand::rng()) as u64;
     if num_tokens < min_tokens {
         num_tokens = min_tokens;
     }

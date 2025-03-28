@@ -15,7 +15,7 @@ use ratatui::{
     symbols,
     symbols::border,
     text::{Line, Text},
-    widgets::{block::Title, Block, Paragraph, Widget},
+    widgets::{Block, Paragraph, Widget},
     DefaultTerminal, Frame,
 };
 use std::collections::HashMap;
@@ -107,9 +107,9 @@ pub async fn run_console(
                                 timestamp: event.timestamp,
                             }));
                         }
-                        BenchmarkEvent::BenchmarkReportEnd => {
+                        BenchmarkEvent::BenchmarkReportEnd(path) => {
                             dispatcher.lock().expect("lock").dispatch(Action::LogMessage(LogMessageUI {
-                                message: "Benchmark report saved.".to_string(),
+                                message: format!("Benchmark report saved to {}", path),
                                 level: LogLevel::Info,
                                 timestamp: chrono::Utc::now(),
                             }));
@@ -286,9 +286,9 @@ impl Widget for &App {
             .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
             .split(bottom_layout[0]);
         // LOGS
-        let logs_title = Title::from("Logs".bold());
+        let logs_title = Line::from("Logs".bold()).centered();
         let logs_block = Block::bordered()
-            .title(logs_title.alignment(Alignment::Center))
+            .title_top(logs_title)
             .border_set(border::THICK);
         List::new(
             state
@@ -339,7 +339,7 @@ impl Widget for &App {
         Paragraph::new(config_text.clone()).render(main_layout[0], buf);
 
         // STEPS
-        let steps_block_title = Title::from("Benchmark steps".bold());
+        let steps_block_title = Line::from("Benchmark steps".bold()).centered();
         let steps_block = Block::bordered()
             .title(steps_block_title.alignment(Alignment::Center))
             .border_set(border::THICK);
@@ -389,7 +389,7 @@ impl Widget for &App {
             .render(steps_graph_layout[0], buf);
 
         // CHARTS
-        let graphs_block_title = Title::from("Token throughput rate".bold());
+        let graphs_block_title = Line::from("Token throughput rate".bold()).centered();
         let graphs_block = Block::bordered()
             .title(graphs_block_title.alignment(Alignment::Center))
             .border_set(border::THICK);

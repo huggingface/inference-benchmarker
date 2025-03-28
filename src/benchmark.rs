@@ -40,7 +40,7 @@ pub enum Event {
     BenchmarkProgress(BenchmarkEvent),
     BenchmarkEnd(BenchmarkEvent),
     Message(MessageEvent),
-    BenchmarkReportEnd,
+    BenchmarkReportEnd(String),
     BenchmarkError(String),
 }
 

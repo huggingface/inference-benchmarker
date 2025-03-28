@@ -192,6 +192,7 @@ pub async fn run(mut run_config: RunConfiguration, stop_sender: Sender<()>) -> a
                     let writer=BenchmarkReportWriter::try_new(config.clone(), report)?;
                     writer.json(path).await?;
                     info!("Report saved to {:?}",path);
+                    let _ = tx.send(Event::BenchmarkReportEnd(format!("{:?}", path)));
                 },
                 Err(e) => {
                     error!("Error running benchmark: {:?}", e.to_string());
@@ -203,7 +204,6 @@ pub async fn run(mut run_config: RunConfiguration, stop_sender: Sender<()>) -> a
             debug!("Received stop signal, stopping benchmark");
         }
     }
-    let _ = tx.send(Event::BenchmarkReportEnd);
     info!("Benchmark finished");
     if !run_config.interactive {
         // quit app if not interactive
