@@ -14,6 +14,7 @@ pub use crate::requests::TokenizeOptions;
 use chrono::Local;
 use crossterm::ExecutableCommand;
 use log::{debug, error, info, warn, Level, LevelFilter};
+use reqwest::Url;
 use tokenizers::{FromPretrainedParameters, Tokenizer};
 use tokio::sync::broadcast::Sender;
 use tokio::sync::Mutex;
@@ -32,7 +33,7 @@ mod table;
 mod writers;
 
 pub struct RunConfiguration {
-    pub url: String,
+    pub url: Url,
     pub tokenizer_name: String,
     pub profile: Option<String>,
     pub max_vus: u64,
@@ -85,7 +86,7 @@ pub async fn run(mut run_config: RunConfiguration, stop_sender: Sender<()>) -> a
     let tokenizer = Arc::new(tokenizer);
     let backend = OpenAITextGenerationBackend::try_new(
         "".to_string(),
-        run_config.url.clone(),
+        run_config.url,
         run_config.model_name.clone(),
         tokenizer,
         run_config.duration,

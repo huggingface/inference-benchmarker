@@ -45,8 +45,8 @@ struct Args {
     warmup: Duration,
     /// The URL of the backend to benchmark. Must be compatible with OpenAI Message API
     #[clap(default_value = "http://localhost:8000", short, long, env)]
-    #[arg(value_parser = parse_url)]
-    url: String,
+    url: Url,
+
     /// Disable console UI
     #[clap(short, long, env)]
     no_console: bool,
@@ -113,13 +113,6 @@ struct Args {
 
 fn parse_duration(s: &str) -> Result<Duration, Error> {
     humantime::parse_duration(s).map_err(|_| Error::new(InvalidValue))
-}
-
-fn parse_url(s: &str) -> Result<String, Error> {
-    match Url::parse(s) {
-        Ok(_) => Ok(s.to_string()),
-        Err(_) => Err(Error::new(InvalidValue)),
-    }
 }
 
 fn parse_key_val(s: &str) -> Result<HashMap<String, String>, Error> {

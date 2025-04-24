@@ -232,7 +232,7 @@ mod tests {
                 w.write_all(b"data: [DONE]\n\n")
             })
             .create_async().await;
-        let url = s.url();
+        let url = s.url().parse().unwrap();
         let tokenizer = Arc::new(Tokenizer::from_pretrained("gpt2", None).unwrap());
         let backend = OpenAITextGenerationBackend::try_new(
             "".to_string(),
