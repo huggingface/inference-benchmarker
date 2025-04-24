@@ -49,6 +49,17 @@ It can be used to benchmark any text generation server that exposes an OpenAI-co
 
 ## Get started
 
+### Install
+
+If you have [cargo](https://rustup.rs/) already installed:
+```bash
+cargo install --git https://github.com/huggingface/inference-benchmarker/
+```
+
+Or download the [latest released binary](https://github.com/huggingface/inference-benchmarker/releases/latest)
+
+Or you can run docker images.
+
 ### Run a benchmark
 
 #### 1. Start an inference server
@@ -76,24 +87,13 @@ docker run --runtime nvidia --gpus all \
     --model $MODEL
 ```
 
-#### 2. Run a benchmark using Docker image
+
+#### 2. Run a benchmark
 
 ```shell
-MODEL=meta-llama/Llama-3.1-8B-Instruct
-HF_TOKEN=<your HF READ token>
-# run a benchmark to evaluate the performance of the model for chat use case
-# we mount results to the current directory
-$ docker run \
-    --rm \
-    -it \
-    --net host \
-    -v $(pwd):/opt/inference-benchmarker/results \
-    -e "HF_TOKEN=$HF_TOKEN" \
-    ghcr.io/huggingface/inference-benchmarker:latest \
-    inference-benchmarker \
-    --tokenizer-name "$MODEL" \
+inference-benchmarker
+    --tokenizer-name "meta-llama/Llama-3.1-8B-Instruct" \
     --url http://localhost:8080 \
-    --profile chat
 ```
 
 Results will be saved in JSON format in current directory.
@@ -132,16 +132,7 @@ Available modes:
 Example running a benchmark at a fixed request rates:
 
 ```shell 
-MODEL=meta-llama/Llama-3.1-8B-Instruct
-HF_TOKEN=<your HF READ token>
-$ docker run \
-    --rm \
-    -it \
-    --net host \
-    -v $(pwd):/opt/inference-benchmarker/results \
-    -e "HF_TOKEN=$HF_TOKEN" \
-    ghcr.io/huggingface/inference-benchmarker:latest \
-    inference-benchmarker \
+inference-benchmarker \
     --tokenizer-name "meta-llama/Llama-3.1-8B-Instruct" \
     --max-vus 800 \
     --duration 120s \
