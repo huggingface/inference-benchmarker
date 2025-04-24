@@ -34,6 +34,7 @@ mod writers;
 
 pub struct RunConfiguration {
     pub url: Url,
+    pub api_key: String,
     pub tokenizer_name: String,
     pub profile: Option<String>,
     pub max_vus: u64,
@@ -85,7 +86,7 @@ pub async fn run(mut run_config: RunConfiguration, stop_sender: Sender<()>) -> a
         };
     let tokenizer = Arc::new(tokenizer);
     let backend = OpenAITextGenerationBackend::try_new(
-        "".to_string(),
+        run_config.api_key,
         run_config.url,
         run_config.model_name.clone(),
         tokenizer,

@@ -47,6 +47,10 @@ struct Args {
     #[clap(default_value = "http://localhost:8000", short, long, env)]
     url: Url,
 
+    /// The api key send to the [`url`] as Header "Authorization: Bearer {API_KEY}".
+    #[clap(default_value = "", short, long, env)]
+    api_key: String,
+
     /// Disable console UI
     #[clap(short, long, env)]
     no_console: bool,
@@ -203,7 +207,8 @@ async fn main() {
         .run_id
         .unwrap_or(uuid::Uuid::new_v4().to_string()[..7].to_string());
     let run_config = RunConfiguration {
-        url: args.url.clone(),
+        url: args.url,
+        api_key: args.api_key,
         profile: args.profile.clone(),
         tokenizer_name: args.tokenizer_name.clone(),
         max_vus: args.max_vus,
