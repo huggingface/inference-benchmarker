@@ -547,7 +547,7 @@ impl ConversationTextRequestGenerator {
         filename: String,
         hf_token: Option<String>,
     ) -> anyhow::Result<PathBuf> {
-        let api = ApiBuilder::new().with_token(hf_token).build()?;
+        let api = ApiBuilder::from_env().with_token(hf_token).build()?;
         let repo = api.dataset(repo_name);
         let dataset = repo.get(&filename)?;
         Ok(dataset)

@@ -197,7 +197,7 @@ async fn main() {
     let stop_sender_clone = stop_sender.clone();
     // get HF token
     let token_env_key = "HF_TOKEN".to_string();
-    let cache = hf_hub::Cache::default();
+    let cache = hf_hub::Cache::from_env();
     let hf_token = match std::env::var(token_env_key).ok() {
         Some(token) => Some(token),
         None => cache.token(),
