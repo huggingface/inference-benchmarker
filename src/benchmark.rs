@@ -12,11 +12,14 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 
 const THROUGHPUT_BUDGET: f64 = 1.2; // sweep up to 120% of max throughput
 
-#[derive(Clone, Debug, strum_macros::Display, Serialize)]
+#[derive(Clone, Debug, strum_macros::Display, Serialize, clap::ValueEnum, Default)]
+#[serde(rename_all = "kebab-case")]
 pub enum BenchmarkKind {
     Throughput,
+    #[default]
     Sweep,
     Rate,
+    Perf,
 }
 
 pub struct MessageEvent {
@@ -111,6 +114,13 @@ impl BenchmarkConfig {
                     ));
                 }
             }
+            BenchmarkKind::Perf => {
+                if self.rates.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "rates must not be specified for perf benchmark"
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -157,6 +167,9 @@ impl Benchmark {
             }
             BenchmarkKind::Sweep => {
                 self.run_sweep().await?;
+            }
+            BenchmarkKind::Perf => {
+                self.run_perf().await?;
             }
             BenchmarkKind::Rate => {
                 self.run_rates().await?;
@@ -319,6 +332,67 @@ impl Benchmark {
             results: Some(results.clone()),
             successful_requests: results.successful_requests() as u64,
             failed_requests: results.failed_requests() as u64,
+        }))?;
+        Ok(())
+    }
+
+    pub async fn run_perf(&mut self) -> anyhow::Result<()> {
+        info!("Running performance benchmark");
+
+        let id = "performance".to_string();
+
+        // notify start event
+        self.event_bus.send(Event::BenchmarkStart(BenchmarkEvent {
+            id: id.clone(),
+            scheduler_type: ExecutorType::ConstantVUs,
+            request_throughput: None,
+            progress: 0.0,
+            results: None,
+            successful_requests: 0,
+            failed_requests: 0,
+        }))?;
+
+        // create progress handler
+        let tx = self.handle_progress(id.clone()).await;
+
+        let mut successful_requests = 0u64;
+        let mut failed_requests = 0u64;
+
+        for i in (1usize..2).map(|i| i.pow(2)) {
+            // start scheduler
+            let mut scheduler = scheduler::Scheduler::new(
+                id.clone(),
+                self.backend.clone(),
+                ExecutorType::ConstantVUs,
+                executors::ExecutorConfig {
+                    max_vus: i as u64,
+                    duration: self.config.duration,
+                    rate: None,
+                },
+                self.requests.clone(),
+                tx.clone(),
+                self.stop_sender.clone(),
+            );
+            scheduler.run().await?;
+            let results = scheduler.get_results().lock().await.clone();
+            info!("Result {results:?}");
+            self.report.add_benchmark_result(results.clone());
+            successful_requests += results.successful_requests() as u64;
+            failed_requests += results.failed_requests() as u64;
+        }
+
+        // send None to close the progress handler
+        tx.send(None).await.unwrap();
+
+        // notify end event
+        self.event_bus.send(Event::BenchmarkEnd(BenchmarkEvent {
+            id: id.clone(),
+            scheduler_type: ExecutorType::ConstantVUs,
+            request_throughput: Some(0.0),
+            progress: 100.0,
+            results: None,
+            successful_requests,
+            failed_requests,
         }))?;
         Ok(())
     }

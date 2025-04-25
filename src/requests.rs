@@ -140,7 +140,7 @@ impl TextGenerationBackend for OpenAITextGenerationBackend {
         let body = OpenAITextGenerationRequest {
             model: self.model_name.clone(),
             messages,
-            max_tokens: request.num_decode_tokens,
+            max_tokens: Some(20),
             stream: true,
             stop: None,
             temperature: 0.0,
@@ -218,22 +218,13 @@ impl TextGenerationBackend for OpenAITextGenerationBackend {
                 }
                 Err(e) => {
                     match e {
-                        Error::Utf8(_) => {
-                            aggregated_response.fail();
-                        }
-                        Error::Parser(_) => {
-                            aggregated_response.fail();
-                        }
-                        Error::Transport(_) => {
-                            aggregated_response.fail();
-                        }
-                        Error::InvalidContentType(_, _) => {
-                            aggregated_response.fail();
-                        }
-                        Error::InvalidStatusCode(_, _) => {
-                            aggregated_response.fail();
-                        }
-                        Error::InvalidLastEventId(_) => {
+                        Error::Utf8(_)
+                        | Error::Parser(_)
+                        | Error::Transport(_)
+                        | Error::InvalidContentType(_, _)
+                        | Error::InvalidStatusCode(_, _)
+                        | Error::InvalidLastEventId(_) => {
+                            error!("Got SSE error : {e}");
                             aggregated_response.fail();
                         }
                         Error::StreamEnded => {
