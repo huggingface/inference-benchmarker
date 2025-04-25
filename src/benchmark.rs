@@ -12,11 +12,14 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 
 const THROUGHPUT_BUDGET: f64 = 1.2; // sweep up to 120% of max throughput
 
-#[derive(Clone, Debug, strum_macros::Display, Serialize)]
+#[derive(Clone, Debug, strum_macros::Display, Serialize, clap::ValueEnum, Default)]
+#[serde(rename_all = "kebab-case")]
 pub enum BenchmarkKind {
     Throughput,
+    #[default]
     Sweep,
     Rate,
+    Perf,
 }
 
 pub struct MessageEvent {
@@ -111,6 +114,13 @@ impl BenchmarkConfig {
                     ));
                 }
             }
+            BenchmarkKind::Perf => {
+                if self.rates.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "rates must not be specified for perf benchmark"
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -157,6 +167,9 @@ impl Benchmark {
             }
             BenchmarkKind::Sweep => {
                 self.run_sweep().await?;
+            }
+            BenchmarkKind::Perf => {
+                self.run_perf().await?;
             }
             BenchmarkKind::Rate => {
                 self.run_rates().await?;
@@ -320,6 +333,10 @@ impl Benchmark {
             successful_requests: results.successful_requests() as u64,
             failed_requests: results.failed_requests() as u64,
         }))?;
+        Ok(())
+    }
+
+    pub async fn run_perf(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
 

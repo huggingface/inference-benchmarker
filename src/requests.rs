@@ -154,6 +154,7 @@ impl TextGenerationBackend for OpenAITextGenerationBackend {
             )
             .json(&serde_json::json!(body))
             .timeout(self.timeout);
+        info!("Sending request");
         // start timer
         aggregated_response.start();
         let mut es = EventSource::new(req).unwrap();
@@ -217,6 +218,7 @@ impl TextGenerationBackend for OpenAITextGenerationBackend {
                     };
                 }
                 Err(e) => {
+                    error!("Got SSE error : {e}");
                     match e {
                         Error::Utf8(_) => {
                             aggregated_response.fail();

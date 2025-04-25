@@ -1,6 +1,6 @@
 use clap::error::ErrorKind::InvalidValue;
 use clap::{ArgGroup, Error, Parser};
-use inference_benchmarker::{run, RunConfiguration, TokenizeOptions};
+use inference_benchmarker::{run, BenchmarkKind, RunConfiguration, TokenizeOptions};
 use log::{debug, error};
 use reqwest::Url;
 use std::collections::HashMap;
@@ -37,10 +37,17 @@ struct Args {
     #[clap(long, env, group = "group_profile")]
     profile: Option<String>,
     /// The kind of benchmark to run (throughput, sweep, optimum)
-    #[clap(default_value = "sweep", short, long, env, group = "group_manual")]
-    benchmark_kind: String,
+    #[clap(
+        default_value = "sweep",
+        short,
+        long,
+        env,
+        group = "group_manual",
+        value_enum
+    )]
+    benchmark_kind: BenchmarkKind,
     /// The duration of the prewarm step ran before the benchmark to warm up the backend (JIT, caches, etc.)
-    #[clap(default_value = "30s", short, long, env, group = "group_manual")]
+    #[clap(default_value = "1s", short, long, env, group = "group_manual")]
     #[arg(value_parser = parse_duration)]
     warmup: Duration,
     /// The URL of the backend to benchmark. Must be compatible with OpenAI Message API
@@ -215,7 +222,7 @@ async fn main() {
         duration: args.duration,
         rates: args.rates,
         num_rates: args.num_rates,
-        benchmark_kind: args.benchmark_kind.clone(),
+        benchmark_kind: args.benchmark_kind,
         warmup_duration: args.warmup,
         interactive: !args.no_console,
         prompt_options: args.prompt_options.clone(),
