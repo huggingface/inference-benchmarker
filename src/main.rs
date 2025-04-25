@@ -1,7 +1,8 @@
+use anyhow::Result;
 use clap::error::ErrorKind::InvalidValue;
 use clap::{ArgGroup, Error, Parser};
 use inference_benchmarker::{run, BenchmarkKind, RunConfiguration, TokenizeOptions};
-use log::{debug, error};
+use log::debug;
 use reqwest::Url;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -23,7 +24,7 @@ struct Args {
     #[clap(default_value = "128", short, long, env, group = "group_manual")]
     max_vus: u64,
     /// The duration of each benchmark step
-    #[clap(default_value = "120s", short, long, env, group = "group_manual")]
+    #[clap(default_value = "10s", short, long, env, group = "group_manual")]
     #[arg(value_parser = parse_duration)]
     duration: Duration,
     /// A list of rates of requests to send per second (only valid for the ConstantArrivalRate benchmark).
@@ -38,7 +39,7 @@ struct Args {
     profile: Option<String>,
     /// The kind of benchmark to run (throughput, sweep, optimum)
     #[clap(
-        default_value = "sweep",
+        default_value = "perf",
         short,
         long,
         env,
@@ -176,7 +177,7 @@ fn parse_tokenizer_options(s: &str) -> Result<TokenizeOptions, Error> {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     let args = Args::parse();
     let git_sha = option_env!("VERGEN_GIT_SHA").unwrap_or("unknown");
     println!(
@@ -234,14 +235,5 @@ async fn main() {
         model_name,
         run_id,
     };
-    let main_thread = tokio::spawn(async move {
-        match run(run_config, stop_sender_clone).await {
-            Ok(_) => {}
-            Err(e) => {
-                error!("Fatal: {:?}", e);
-                println!("Fatal: {:?}", e)
-            }
-        };
-    });
-    let _ = main_thread.await;
+    run(run_config, stop_sender_clone).await
 }

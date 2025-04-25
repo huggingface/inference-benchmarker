@@ -337,6 +337,63 @@ impl Benchmark {
     }
 
     pub async fn run_perf(&mut self) -> anyhow::Result<()> {
+        info!("Running performance benchmark");
+
+        let id = "performance".to_string();
+
+        // notify start event
+        self.event_bus.send(Event::BenchmarkStart(BenchmarkEvent {
+            id: id.clone(),
+            scheduler_type: ExecutorType::ConstantVUs,
+            request_throughput: None,
+            progress: 0.0,
+            results: None,
+            successful_requests: 0,
+            failed_requests: 0,
+        }))?;
+
+        // create progress handler
+        let tx = self.handle_progress(id.clone()).await;
+
+        let mut successful_requests = 0u64;
+        let mut failed_requests = 0u64;
+
+        for i in (1usize..2).map(|i| i.pow(2)) {
+            // start scheduler
+            let mut scheduler = scheduler::Scheduler::new(
+                id.clone(),
+                self.backend.clone(),
+                ExecutorType::ConstantVUs,
+                executors::ExecutorConfig {
+                    max_vus: i as u64,
+                    duration: self.config.duration,
+                    rate: None,
+                },
+                self.requests.clone(),
+                tx.clone(),
+                self.stop_sender.clone(),
+            );
+            scheduler.run().await?;
+            let results = scheduler.get_results().lock().await.clone();
+            info!("Result {results:?}");
+            self.report.add_benchmark_result(results.clone());
+            successful_requests += results.successful_requests() as u64;
+            failed_requests += results.failed_requests() as u64;
+        }
+
+        // send None to close the progress handler
+        tx.send(None).await.unwrap();
+
+        // notify end event
+        self.event_bus.send(Event::BenchmarkEnd(BenchmarkEvent {
+            id: id.clone(),
+            scheduler_type: ExecutorType::ConstantVUs,
+            request_throughput: Some(0.0),
+            progress: 100.0,
+            results: None,
+            successful_requests,
+            failed_requests,
+        }))?;
         Ok(())
     }
 
