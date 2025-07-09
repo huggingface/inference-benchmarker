@@ -3,11 +3,11 @@ nameOverride: ""
 fullnameOverride: ""
 
 hf_token: ""
-model_id: "meta-llama/Llama-3.1-8B-Instruct"
-server: tgi
+model_id: "microsoft/Phi-3-mini-4k-instruct"
+server: vllm
 
 tgi:
-  enabled: true
+  enabled: false
   extra_args:
     - "--max-concurrent-requests"
     - "512"
@@ -28,7 +28,7 @@ tgi:
   affinity: { }
 
 vllm:
-  enabled: false
+  enabled: true
   extra_args:
   image:
     repository: vllm/vllm-openai
@@ -50,7 +50,6 @@ benchmark:
   extra_args:
     - "--profile"
     - "chat"
-    - "800"
   image:
     repository: ghcr.io/huggingface/inference-benchmarker
     pullPolicy: IfNotPresent
