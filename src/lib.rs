@@ -52,6 +52,7 @@ pub struct RunConfiguration {
     pub extra_metadata: Option<HashMap<String, String>>,
     pub model_name: String,
     pub run_id: String,
+    pub output_path: String,
 }
 
 pub async fn run(mut run_config: RunConfiguration, stop_sender: Sender<()>) -> anyhow::Result<()> {
@@ -189,8 +190,7 @@ pub async fn run(mut run_config: RunConfiguration, stop_sender: Sender<()>) -> a
             match report {
                 Ok(_) => {
                     let report = benchmark.get_report();
-                    let path = format!("results/{}_{}.json",run_config.tokenizer_name.replace("/","_").replace(".","_"), chrono::Utc::now().format("%Y-%m-%d-%H-%M-%S"));
-                    let path=Path::new(&path);
+                    let path = Path::new(&run_config.output_path);
                     let writer=BenchmarkReportWriter::try_new(config.clone(), report)?;
                     writer.json(path).await?;
                     info!("Report saved to {:?}",path);

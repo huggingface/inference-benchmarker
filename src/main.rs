@@ -1,3 +1,4 @@
+use chrono::Utc;
 use clap::error::ErrorKind::InvalidValue;
 use clap::{ArgGroup, Error, Parser};
 use inference_benchmarker::{run, RunConfiguration, TokenizeOptions};
@@ -113,6 +114,13 @@ struct Args {
     // results file.
     #[clap(long, env)]
     run_id: Option<String>,
+    /// Output path for the benchmark results JSON file
+    #[clap(
+        default_value = "results/{tokenizer_name}_{timestamp}.json",
+        long, 
+        env,
+        value_parser = validate_output_path)]
+    output_path: String,
 }
 
 fn parse_duration(s: &str) -> Result<Duration, Error> {
@@ -168,6 +176,27 @@ fn parse_tokenizer_options(s: &str) -> Result<TokenizeOptions, Error> {
     Ok(tokenizer_options)
 }
 
+fn validate_output_path(s: &str) -> Result<String, Error> {
+    // First validate that the path ends with .json
+    if !s.to_lowercase().ends_with(".json") {
+        return Err(Error::raw(
+            InvalidValue,
+            format!("Output path must end with a .json file name extension, got: '{}'", s)
+        ));
+    }
+    
+    // For now, return the path as-is. Template replacement will happen later
+    // when we have access to tokenizer_name and timestamp
+    Ok(s.to_string())
+}
+
+fn expand_output_path_template(template: &str, tokenizer_name: &str) -> String {
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d-%H-%M-%S").to_string();
+    template
+        .replace("{tokenizer_name}", tokenizer_name)
+        .replace("{timestamp}", &timestamp)
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -206,6 +235,10 @@ async fn main() {
     let run_id = args
         .run_id
         .unwrap_or(uuid::Uuid::new_v4().to_string()[..7].to_string());
+    
+    // if output_path remains default, replace tokenizer and add timestamp in file template.
+    let expanded_output_path = expand_output_path_template(&args.output_path, &args.tokenizer_name);
+    
     let run_config = RunConfiguration {
         url: args.url,
         api_key: args.api_key,
@@ -226,6 +259,7 @@ async fn main() {
         hf_token,
         model_name,
         run_id,
+        output_path: expanded_output_path,
     };
     let main_thread = tokio::spawn(async move {
         match run(run_config, stop_sender_clone).await {
