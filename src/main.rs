@@ -117,7 +117,7 @@ struct Args {
     /// Output path for the benchmark results JSON file
     #[clap(
         default_value = "results/{tokenizer_name}_{timestamp}.json",
-        long, 
+        long,
         env,
         value_parser = validate_output_path)]
     output_path: String,
@@ -181,10 +181,12 @@ fn validate_output_path(s: &str) -> Result<String, Error> {
     if !s.to_lowercase().ends_with(".json") {
         return Err(Error::raw(
             InvalidValue,
-            format!("Output path must end with a .json file name extension, got: '{}'", s)
+            format!(
+                "Output path must end with a .json file name extension, got: '{}'",
+                s
+            ),
         ));
     }
-    
     // For now, return the path as-is. Template replacement will happen later
     // when we have access to tokenizer_name and timestamp
     Ok(s.to_string())
@@ -235,10 +237,8 @@ async fn main() {
     let run_id = args
         .run_id
         .unwrap_or(uuid::Uuid::new_v4().to_string()[..7].to_string());
-    
     // if output_path remains default, replace tokenizer and add timestamp in file template.
     let expanded_output_path = expand_output_path_template(&args.output_path, &args.tokenizer_name);
-    
     let run_config = RunConfiguration {
         url: args.url,
         api_key: args.api_key,
