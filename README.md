@@ -91,7 +91,7 @@ docker run --runtime nvidia --gpus all \
 #### 2. Run a benchmark
 
 ```shell
-inference-benchmarker
+inference-benchmarker \
     --tokenizer-name "meta-llama/Llama-3.1-8B-Instruct" \
     --url http://localhost:8080 \
     --profile chat
