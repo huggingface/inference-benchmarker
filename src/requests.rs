@@ -130,8 +130,7 @@ impl TextGenerationBackend for OpenAITextGenerationBackend {
         sender: Sender<TextGenerationAggregatedResponse>,
     ) {
         let mut url = self.base_url.clone();
-        url.set_path("/v1/chat/completions");
-        // let url = format!("{base_url}", base_url = self.base_url);
+        url.set_path(&format!("{}/v1/chat/completions", url.path().trim_end_matches('/')));
         let mut aggregated_response = TextGenerationAggregatedResponse::new(request.clone());
         let messages = vec![OpenAITextGenerationMessage {
             role: "user".to_string(),
