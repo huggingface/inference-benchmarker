@@ -75,11 +75,34 @@ def run(from_results_dir, datasource, port):
             ['run_id', 'model', 'rate', 'inter_token_latency_ms_p90', 'time_to_first_token_ms_p90',
              'e2e_latency_ms_p90',
              'token_throughput_secs']]
-        for metric in ['inter_token_latency_ms_p90', 'time_to_first_token_ms_p90', 'e2e_latency_ms_p90',
-                       'token_throughput_secs']:
-            data[metric] = data[metric].apply(lambda x: f"{x:.2f}")
         data = data.rename(
             columns=column_mappings)
+        # return data # uncomment this line if you want to return the raw DataFrame without rounding
+
+        # Ensure numeric columns are properly typed for sorting
+        numeric_cols_to_ensure = [
+            'ITL P90 (ms)', 'TTFT P90 (ms)', 'E2E P90 (ms)',
+            'Throughput (tokens/s)', 'QPS'
+        ]
+
+        for col in numeric_cols_to_ensure:
+            if col in data.columns:
+                data[col] = pd.to_numeric(data[col], errors='coerce')
+
+        # Round numeric columns to reduce decimal places while maintaining sorting
+        # see https://github.com/huggingface/inference-benchmarker/issues/24
+        rounding_rules = {
+            'ITL P90 (ms)': 2,
+            'TTFT P90 (ms)': 2,
+            'E2E P90 (ms)': 2,
+            'Throughput (tokens/s)': 2,
+            'QPS': 0  # Round to integers
+        }
+
+        for col, decimals in rounding_rules.items():
+            if col in data.columns:
+                data[col] = data[col].round(decimals)
+
         return data
 
     def load_bench_results(source) -> pd.DataFrame:
