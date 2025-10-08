@@ -241,7 +241,7 @@ impl BenchmarkResults {
     /// Calculate the quantile of a given data set using interpolation method
     /// Results are similar to `numpy.percentile`
     fn quantile_duration(&self, mut data: Vec<Duration>, quantile: f64) -> anyhow::Result<f64> {
-        if self.is_ready() {
+        if self.is_ready() && data.len() > 1 {
             data.sort();
             let i = (quantile * (data.len() - 1) as f64).floor();
             let delta = (data.len() - 1) as f64 * quantile - i;

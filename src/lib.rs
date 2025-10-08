@@ -41,7 +41,7 @@ pub struct RunConfiguration {
     pub duration: std::time::Duration,
     pub rates: Option<Vec<f64>>,
     pub num_rates: u64,
-    pub benchmark_kind: String,
+    pub benchmark_kind: BenchmarkKind,
     pub warmup_duration: std::time::Duration,
     pub interactive: bool,
     pub prompt_options: Option<TokenizeOptions>,
@@ -96,12 +96,7 @@ pub async fn run(mut run_config: RunConfiguration, stop_sender: Sender<()>) -> a
     let config = BenchmarkConfig {
         max_vus: run_config.max_vus,
         duration: run_config.duration,
-        benchmark_kind: match run_config.benchmark_kind.to_lowercase().as_str() {
-            "throughput" => BenchmarkKind::Throughput,
-            "sweep" => BenchmarkKind::Sweep,
-            "rate" => BenchmarkKind::Rate,
-            _ => BenchmarkKind::Sweep,
-        },
+        benchmark_kind: run_config.benchmark_kind,
         warmup_duration: run_config.warmup_duration,
         rates: run_config.rates,
         num_rates: run_config.num_rates,
@@ -120,7 +115,7 @@ pub async fn run(mut run_config: RunConfiguration, stop_sender: Sender<()>) -> a
         let target = Box::new(File::create("log.txt").expect("Can't create file"));
         env_logger::Builder::new()
             .target(env_logger::Target::Pipe(target))
-            .filter(Some("inference_benchmarker"), LevelFilter::Debug)
+            .filter(Some("inference_benchmarker"), LevelFilter::Info)
             .format(|buf, record| {
                 writeln!(
                     buf,

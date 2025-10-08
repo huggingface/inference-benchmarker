@@ -1,7 +1,8 @@
+use anyhow::Result;
 use clap::error::ErrorKind::InvalidValue;
 use clap::{ArgGroup, Error, Parser};
-use inference_benchmarker::{run, RunConfiguration, TokenizeOptions};
-use log::{debug, error};
+use inference_benchmarker::{run, BenchmarkKind, RunConfiguration, TokenizeOptions};
+use log::debug;
 use reqwest::Url;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -23,7 +24,7 @@ struct Args {
     #[clap(default_value = "128", short, long, env, group = "group_manual")]
     max_vus: u64,
     /// The duration of each benchmark step
-    #[clap(default_value = "120s", short, long, env, group = "group_manual")]
+    #[clap(default_value = "10s", short, long, env, group = "group_manual")]
     #[arg(value_parser = parse_duration)]
     duration: Duration,
     /// A list of rates of requests to send per second (only valid for the ConstantArrivalRate benchmark).
@@ -37,10 +38,17 @@ struct Args {
     #[clap(long, env, group = "group_profile")]
     profile: Option<String>,
     /// The kind of benchmark to run (throughput, sweep, optimum)
-    #[clap(default_value = "sweep", short, long, env, group = "group_manual")]
-    benchmark_kind: String,
+    #[clap(
+        default_value = "perf",
+        short,
+        long,
+        env,
+        group = "group_manual",
+        value_enum
+    )]
+    benchmark_kind: BenchmarkKind,
     /// The duration of the prewarm step ran before the benchmark to warm up the backend (JIT, caches, etc.)
-    #[clap(default_value = "30s", short, long, env, group = "group_manual")]
+    #[clap(default_value = "1s", short, long, env, group = "group_manual")]
     #[arg(value_parser = parse_duration)]
     warmup: Duration,
     /// The URL of the backend to benchmark. Must be compatible with OpenAI Message API
@@ -169,7 +177,7 @@ fn parse_tokenizer_options(s: &str) -> Result<TokenizeOptions, Error> {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     let args = Args::parse();
     let git_sha = option_env!("VERGEN_GIT_SHA").unwrap_or("unknown");
     println!(
@@ -215,7 +223,7 @@ async fn main() {
         duration: args.duration,
         rates: args.rates,
         num_rates: args.num_rates,
-        benchmark_kind: args.benchmark_kind.clone(),
+        benchmark_kind: args.benchmark_kind,
         warmup_duration: args.warmup,
         interactive: !args.no_console,
         prompt_options: args.prompt_options.clone(),
@@ -227,14 +235,5 @@ async fn main() {
         model_name,
         run_id,
     };
-    let main_thread = tokio::spawn(async move {
-        match run(run_config, stop_sender_clone).await {
-            Ok(_) => {}
-            Err(e) => {
-                error!("Fatal: {:?}", e);
-                println!("Fatal: {:?}", e)
-            }
-        };
-    });
-    let _ = main_thread.await;
+    run(run_config, stop_sender_clone).await
 }

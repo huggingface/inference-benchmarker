@@ -1,4 +1,4 @@
-use crate::{RunConfiguration, TokenizeOptions};
+use crate::{BenchmarkKind, RunConfiguration, TokenizeOptions};
 use std::string::ToString;
 
 pub fn apply_profile(
@@ -11,7 +11,7 @@ pub fn apply_profile(
             duration: std::time::Duration::from_secs(120),
             rates: None,
             num_rates: 10,
-            benchmark_kind: "sweep".to_string(),
+            benchmark_kind: BenchmarkKind::Sweep,
             warmup_duration: std::time::Duration::from_secs(30),
             prompt_options: Some(TokenizeOptions {
                 num_tokens: Some(200),
@@ -40,7 +40,7 @@ pub fn apply_profile(
                 duration: std::time::Duration::from_secs(120),
                 rates: None,
                 num_rates: 10,
-                benchmark_kind: "sweep".to_string(),
+                benchmark_kind: BenchmarkKind::Sweep,
                 warmup_duration: std::time::Duration::from_secs(30),
                 prompt_options: None, // use prompts from dataset
                 decode_options: Some(TokenizeOptions {
@@ -62,7 +62,7 @@ pub fn apply_profile(
                 duration: std::time::Duration::from_secs(120),
                 rates: None,
                 num_rates: 10,
-                benchmark_kind: "sweep".to_string(),
+                benchmark_kind: BenchmarkKind::Sweep,
                 warmup_duration: std::time::Duration::from_secs(30),
                 prompt_options: Some(TokenizeOptions {
                     num_tokens: Some(4096),
@@ -91,7 +91,7 @@ pub fn apply_profile(
                 duration: std::time::Duration::from_secs(120),
                 rates: None,
                 num_rates: 10,
-                benchmark_kind: "sweep".to_string(),
+                benchmark_kind: BenchmarkKind::Sweep,
                 warmup_duration: std::time::Duration::from_secs(30),
                 prompt_options: Some(TokenizeOptions {
                     num_tokens: Some(10000),
