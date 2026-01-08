@@ -43,6 +43,8 @@ spec:
                 secretKeyRef:
                   name: {{ include "inference-benchmarker.fullname" . }}-hf-token
                   key: HF_TOKEN
+            - name: HOME
+              value: /tmp
           args:
             - "--model"
             - "{{ .Values.model_id }}"

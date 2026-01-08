@@ -210,10 +210,50 @@ values, sampling token counts from a normal distribution with the specified vari
 
 You can deploy the benchmarking tool on Kubernetes using the provided Helm chart.
 
-Review the values (especially model, HF token and resources), and install the chart:
+Review the `values.yaml` file (especially model, HF token and resources), and install the chart:
 ```shell
 $ helm install inference-benchmarker ./extra/k8s/inference-benchmarker
 ```
+
+## Persisting benchmark results
+
+The default chart mounts the **results** volume with `emptyDir`, so files vanish when the pod terminates.
+Create a **PersistentVolumeClaim** named `results`, using a StorageClass that fits *your* cluster policy (e.g. `gp2`, `rook-ceph`, `shared-rwx`, …), then patch the chart to use it.
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: results
+spec:
+  storageClassName: example      # ← change to your StorageClass
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 5Gi
+```
+
+```bash
+kubectl apply -f pvc.yaml
+```
+
+Edit `templates/benchmark.yaml` (or patch via values) so the volume becomes:
+
+```yaml
+volumes:
+  - name: results
+    persistentVolumeClaim:
+      claimName: results
+```
+
+After each run the benchmark drops its **JSON** reports into the `results` PVC, where you can:
+
+* `kubectl cp` them locally
+* mount the PVC in other pods for post-processing
+
+Deploy, benchmark, and iterate—without losing your data between runs!
+
 
 ## Deploy on Slurm
 
