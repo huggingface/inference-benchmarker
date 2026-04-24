@@ -43,6 +43,8 @@ spec:
                 secretKeyRef:
                   name: {{ include "inference-benchmarker.fullname" . }}-hf-token
                   key: HF_TOKEN
+            - name: HOME
+              value: /data
           args:
             - "--model"
             - "{{ .Values.model_id }}"
@@ -66,12 +68,16 @@ spec:
           volumeMounts:
             - name: shm
               mountPath: /dev/shm
+            - name: cache
+              mountPath: /data
       terminationGracePeriodSeconds: 10
       volumes:
         - name: shm
           emptyDir:
             medium: Memory
             sizeLimit: 1Gi
+        - name: cache
+          emptyDir: {}
       {{- with .Values.vllm.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
