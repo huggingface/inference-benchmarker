@@ -241,19 +241,17 @@ impl BenchmarkResults {
     /// Calculate the quantile of a given data set using interpolation method
     /// Results are similar to `numpy.percentile`
     fn quantile_duration(&self, mut data: Vec<Duration>, quantile: f64) -> anyhow::Result<f64> {
-        if self.is_ready() {
-            data.sort();
-            let i = (quantile * (data.len() - 1) as f64).floor();
-            let delta = (data.len() - 1) as f64 * quantile - i;
-            if i as usize >= data.len() {
-                return Err(anyhow::anyhow!(NoResponses));
-            }
-            let quantile = (1. - delta) * data[i as usize].as_secs_f64()
-                + delta * data[i as usize + 1].as_secs_f64();
-            Ok(quantile)
-        } else {
-            Err(anyhow::anyhow!(NoResponses))
+        if !self.is_ready() || data.is_empty() {
+            return Err(anyhow::anyhow!(NoResponses));
         }
+        data.sort();
+        let i = (quantile * (data.len() - 1) as f64).floor() as usize;
+        let delta = (data.len() - 1) as f64 * quantile - i as f64;
+        if i + 1 >= data.len() {
+            return Ok(data[i].as_secs_f64());
+        }
+        let quantile = (1. - delta) * data[i].as_secs_f64() + delta * data[i + 1].as_secs_f64();
+        Ok(quantile)
     }
 }
 
@@ -440,6 +438,43 @@ mod test {
         assert_eq!(
             results.time_to_first_token_percentile(0.5).unwrap(),
             Duration::from_millis(850)
+        );
+    }
+
+    #[test]
+    fn test_percentile_with_single_successful_response() {
+        let request = Arc::from(TextGenerationRequest {
+            id: None,
+            prompt: "test".to_string(),
+            num_prompt_tokens: 10,
+            num_decode_tokens: None,
+        });
+        let mut response = TextGenerationAggregatedResponse::new(request);
+        response.start_time = Some(tokio::time::Instant::now());
+        response.end_time =
+            Some(tokio::time::Instant::now() + tokio::time::Duration::from_millis(100));
+        response.num_generated_tokens = 100;
+        response.failed = false;
+        response.times_to_tokens = vec![Duration::from_millis(100)];
+
+        let mut results = BenchmarkResults::new(
+            "test".to_string(),
+            ExecutorType::ConstantArrivalRate,
+            ExecutorConfig {
+                max_vus: 0,
+                duration: Default::default(),
+                rate: None,
+            },
+        );
+        results.add_response(response);
+
+        assert_eq!(
+            results.time_to_first_token_percentile(0.5).unwrap(),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            results.time_to_first_token_percentile(0.9).unwrap(),
+            Duration::from_millis(100)
         );
     }
 }
