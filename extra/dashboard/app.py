@@ -77,7 +77,7 @@ def run(from_results_dir, datasource, port):
              'token_throughput_secs']]
         for metric in ['inter_token_latency_ms_p90', 'time_to_first_token_ms_p90', 'e2e_latency_ms_p90',
                        'token_throughput_secs']:
-            data[metric] = data[metric].apply(lambda x: f"{x:.2f}")
+            data[metric] = pd.to_numeric(data[metric], errors='coerce').round(2)
         data = data.rename(
             columns=column_mappings)
         return data
