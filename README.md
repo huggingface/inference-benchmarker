@@ -21,6 +21,11 @@ It can be used to benchmark any text generation server that exposes an OpenAI-co
 * Benchmark profiles: Presets to benchmark for different model use cases (eg. chat, summarization, code completion...).
 * High-Performance: Built with Rust 🦀 for high-performance benchmarking.
 * JSON Output: Delivers performance results in a structured, easy-to-analyze format.
+* Traffic Replay: Re-sends recorded requests at their recorded times, at any speed.
+* Accuracy and Conversation Suites: Scores answers with fixed rules (multiple choice, final number, contains, regex, JSON, word count), no judge model.
+* Reliability: Error rate by kind, timeouts, SLO attainment, goodput and cost per request.
+* Request Traces: One record per request (timings, tokens, status, check result, optionally the text).
+* Rust Library: Everything above is available from Rust with `run_benchmark`.
 
 ![ui.png](assets/ui.png)
 
@@ -40,6 +45,7 @@ It can be used to benchmark any text generation server that exposes an OpenAI-co
       * [Dataset configuration](#dataset-configuration)
       * [Prompt configuration](#prompt-configuration)
     * [Decode options](#decode-options)
+  * [Use as a library](#use-as-a-library)
   * [Deploy on Kubernetes](#deploy-on-kubernetes)
   * [Deploy on Slurm](#deploy-on-slurm)
   * [Visualize the results](#visualize-the-results)
@@ -205,6 +211,41 @@ values, sampling token counts from a normal distribution with the specified vari
 ```shell
 --decode-options "num_tokens=50,max_tokens=60,min_tokens=40,variance=10"
 ```
+
+## Use as a library
+
+Turn off the default `cli` feature to get the library without the terminal UI:
+
+```toml
+inference-benchmarker = { git = "https://github.com/infervisor/inference-benchmarker", default-features = false }
+```
+
+```rust
+use inference_benchmarker::*;
+use std::sync::Arc;
+
+let tokenizer = Arc::new(hub::load_tokenizer("google/gemma-3-12b-it", Some(&hf_token), None).await?);
+let config = BenchmarkConfig {
+    benchmark_kind: BenchmarkKind::Replay, // or Throughput, Sweep, Rate, Once
+    max_vus: 64,
+    replay_speed: 2.0, // twice the recorded load
+    slo: Some(slo::Slo { ttft_ms: Some(500.0), ..Default::default() }),
+    ..Default::default()
+};
+let target = Target { url: "http://gpu-node:8000".parse()?, api_key, model: "gemma-3-12b".into() };
+let requests: Vec<TextGenerationRequest> = recorded_traffic(); // each with `offset`, `history`, `prompt`
+let (stop, _) = tokio::sync::broadcast::channel(1);
+let (tx, mut traces) = tokio::sync::mpsc::channel(1024);
+let options = RunOptions { events: None, records: Some(record::RecordSink { tx, include_text: false }) };
+let report = run_benchmark(config, target, Workload::Requests(requests), tokenizer, options, stop).await?;
+```
+
+- `Workload::Synthetic` sends random prompts of `prompt_options.num_tokens` tokens.
+- `Workload::Conversations` sends multi-turn chats; every turn carries the model's own earlier answers.
+- `Workload::Requests` sends a fixed list: `Once` sends each request one time (accuracy suites, using
+  `TextGenerationRequest::check`), `Replay` sends each at its `offset`.
+- `report` is the same `BenchmarkReportWriter` the CLI writes as JSON; it serializes and deserializes.
+- Fire `stop` to cancel: the error downcasts to `Cancelled`, which holds the steps that finished.
 
 ## Deploy on Kubernetes
 

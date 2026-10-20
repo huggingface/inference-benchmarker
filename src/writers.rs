@@ -1,11 +1,16 @@
-use crate::results::{BenchmarkReport, BenchmarkResults};
-use crate::{executors, table, BenchmarkConfig};
-use serde::Serialize;
+use crate::cost::{CostResult, GpuCost};
+use crate::requests::ErrorKind;
+use crate::results::{AccuracyResult, BenchmarkReport, BenchmarkResults};
+use crate::slo::{Slo, SloResult};
+use crate::{executors, BenchmarkConfig};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 use sysinfo::{CpuRefreshKind, MemoryRefreshKind, System};
 use tokio::fs;
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PercentilesWriter {
     pub p50: f64,
     pub p60: f64,
@@ -17,73 +22,113 @@ pub struct PercentilesWriter {
     pub avg: f64,
 }
 
-#[derive(Serialize)]
+impl PercentilesWriter {
+    /// Milliseconds from a percentile function and an average; 0 when there is no data.
+    fn from_durations(
+        percentile: impl Fn(f64) -> anyhow::Result<Duration>,
+        avg: anyhow::Result<Duration>,
+    ) -> Self {
+        let ms = |d: anyhow::Result<Duration>| {
+            d.map(|d| d.as_micros() as f64 / 1000.).unwrap_or_default()
+        };
+        Self {
+            p50: ms(percentile(0.5)),
+            p60: ms(percentile(0.6)),
+            p70: ms(percentile(0.7)),
+            p80: ms(percentile(0.8)),
+            p90: ms(percentile(0.9)),
+            p95: ms(percentile(0.95)),
+            p99: ms(percentile(0.99)),
+            avg: ms(avg),
+        }
+    }
+}
+
+/// The results of one benchmark step.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct BenchmarkResultsWriter {
-    id: String,
-    executor_type: String,
-    config: executors::ExecutorConfig,
-    total_requests: u64,
-    total_tokens: u64,
-    token_throughput_secs: f64,
-    duration_ms: u128,
-    time_to_first_token_ms: PercentilesWriter,
-    inter_token_latency_ms: PercentilesWriter,
-    failed_requests: u64,
-    successful_requests: u64,
-    request_rate: f64,
-    total_tokens_sent: u64,
-    e2e_latency_ms: PercentilesWriter,
+    pub id: String,
+    pub executor_type: String,
+    pub config: executors::ExecutorConfig,
+    pub total_requests: u64,
+    pub total_tokens: u64,
+    pub token_throughput_secs: f64,
+    pub duration_ms: u128,
+    pub time_to_first_token_ms: PercentilesWriter,
+    pub inter_token_latency_ms: PercentilesWriter,
+    pub failed_requests: u64,
+    pub successful_requests: u64,
+    pub request_rate: f64,
+    pub total_tokens_sent: u64,
+    pub e2e_latency_ms: PercentilesWriter,
+    #[serde(default)]
+    pub prompt_tokens_avg: f64,
+    #[serde(default)]
+    pub output_tokens_avg: f64,
+    #[serde(default)]
+    pub error_rate: f64,
+    #[serde(default)]
+    pub timeout_rate: f64,
+    #[serde(default)]
+    pub errors_by_kind: BTreeMap<ErrorKind, u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accuracy: Option<AccuracyResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slo: Option<SloResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<CostResult>,
 }
 
 impl BenchmarkResultsWriter {
-    pub fn new(results: BenchmarkResults) -> anyhow::Result<BenchmarkResultsWriter> {
+    pub fn new(
+        results: BenchmarkResults,
+        slo: Option<&Slo>,
+        gpu_cost: Option<&GpuCost>,
+    ) -> anyhow::Result<BenchmarkResultsWriter> {
+        let duration = results.duration().unwrap_or_default();
         Ok(BenchmarkResultsWriter {
             id: results.id.clone(),
             executor_type: results.executor_type().to_string(),
             config: results.executor_config(),
             total_requests: results.total_requests() as u64,
             total_tokens: results.total_tokens(),
-            token_throughput_secs: results.token_throughput_secs()?,
-            duration_ms: results.duration().ok().unwrap().as_micros() / 1000,
-            time_to_first_token_ms: PercentilesWriter {
-                p50: results.time_to_first_token_percentile(0.5)?.as_micros() as f64 / 1000.,
-                p60: results.time_to_first_token_percentile(0.6)?.as_micros() as f64 / 1000.,
-                p70: results.time_to_first_token_percentile(0.7)?.as_micros() as f64 / 1000.,
-                p80: results.time_to_first_token_percentile(0.8)?.as_micros() as f64 / 1000.,
-                p90: results.time_to_first_token_percentile(0.9)?.as_micros() as f64 / 1000.,
-                p95: results.time_to_first_token_percentile(0.95)?.as_micros() as f64 / 1000.,
-                p99: results.time_to_first_token_percentile(0.99)?.as_micros() as f64 / 1000.,
-                avg: results.time_to_first_token_avg().ok().unwrap().as_micros() as f64 / 1000.,
-            },
-            inter_token_latency_ms: PercentilesWriter {
-                p50: results.inter_token_latency_percentile(0.5)?.as_micros() as f64 / 1000.,
-                p60: results.inter_token_latency_percentile(0.6)?.as_micros() as f64 / 1000.,
-                p70: results.inter_token_latency_percentile(0.7)?.as_micros() as f64 / 1000.,
-                p80: results.inter_token_latency_percentile(0.8)?.as_micros() as f64 / 1000.,
-                p90: results.inter_token_latency_percentile(0.9)?.as_micros() as f64 / 1000.,
-                p95: results.inter_token_latency_percentile(0.95)?.as_micros() as f64 / 1000.,
-                p99: results.inter_token_latency_percentile(0.99)?.as_micros() as f64 / 1000.,
-                avg: results.inter_token_latency_avg().ok().unwrap().as_micros() as f64 / 1000.,
-            },
+            token_throughput_secs: results.token_throughput_secs().unwrap_or_default(),
+            duration_ms: duration.as_micros() / 1000,
+            time_to_first_token_ms: PercentilesWriter::from_durations(
+                |p| results.time_to_first_token_percentile(p),
+                results.time_to_first_token_avg(),
+            ),
+            inter_token_latency_ms: PercentilesWriter::from_durations(
+                |p| results.inter_token_latency_percentile(p),
+                results.inter_token_latency_avg(),
+            ),
             failed_requests: results.failed_requests() as u64,
             successful_requests: results.successful_requests() as u64,
-            request_rate: results.successful_request_rate()?,
+            request_rate: results.successful_request_rate().unwrap_or_default(),
             total_tokens_sent: results.total_tokens_sent(),
-            e2e_latency_ms: PercentilesWriter {
-                p50: results.e2e_latency_percentile(0.5)?.as_micros() as f64 / 1000.,
-                p60: results.e2e_latency_percentile(0.6)?.as_micros() as f64 / 1000.,
-                p70: results.e2e_latency_percentile(0.7)?.as_micros() as f64 / 1000.,
-                p80: results.e2e_latency_percentile(0.8)?.as_micros() as f64 / 1000.,
-                p90: results.e2e_latency_percentile(0.9)?.as_micros() as f64 / 1000.,
-                p95: results.e2e_latency_percentile(0.95)?.as_micros() as f64 / 1000.,
-                p99: results.e2e_latency_percentile(0.99)?.as_micros() as f64 / 1000.,
-                avg: results.e2e_latency_avg().ok().unwrap().as_micros() as f64 / 1000.,
-            },
+            e2e_latency_ms: PercentilesWriter::from_durations(
+                |p| results.e2e_latency_percentile(p),
+                results.e2e_latency_avg(),
+            ),
+            prompt_tokens_avg: results.prompt_tokens_avg().unwrap_or_default(),
+            output_tokens_avg: results.output_tokens_avg(),
+            error_rate: results.error_rate(),
+            timeout_rate: results.timeout_rate(),
+            errors_by_kind: results.errors_by_kind(),
+            accuracy: results.accuracy(),
+            slo: slo.map(|slo| results.slo(slo)),
+            cost: gpu_cost.map(|c| {
+                c.for_step(
+                    duration,
+                    results.successful_requests() as u64,
+                    results.total_tokens(),
+                )
+            }),
         })
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SystemInfo {
     pub cpu: Vec<String>,
     pub memory: String,
@@ -111,21 +156,22 @@ impl SystemInfo {
                 "{:.2} GB",
                 s.total_memory() as f64 / 1024.0 / 1024.0 / 1024.0
             ),
-            os_name: System::name().ok_or("N/A").unwrap(),
-            os_version: System::os_version().ok_or("N/A").unwrap(),
-            kernel: System::kernel_version().ok_or("N/A").unwrap(),
-            hostname: System::host_name().ok_or("N/A").unwrap(),
+            os_name: System::name().unwrap_or_else(|| "N/A".into()),
+            os_version: System::os_version().unwrap_or_else(|| "N/A".into()),
+            kernel: System::kernel_version().unwrap_or_else(|| "N/A".into()),
+            hostname: System::host_name().unwrap_or_else(|| "N/A".into()),
         }
     }
 }
 
-#[derive(Serialize)]
+/// The whole report: what the CLI writes as JSON and what library callers get back.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BenchmarkReportWriter {
-    config: BenchmarkConfig,
-    results: Vec<BenchmarkResultsWriter>,
-    start_time: String,
-    end_time: String,
-    system: SystemInfo,
+    pub config: BenchmarkConfig,
+    pub results: Vec<BenchmarkResultsWriter>,
+    pub start_time: String,
+    pub end_time: String,
+    pub system: SystemInfo,
     #[serde(skip)]
     report: BenchmarkReport,
 }
@@ -137,7 +183,8 @@ impl BenchmarkReportWriter {
     ) -> anyhow::Result<BenchmarkReportWriter> {
         let mut results: Vec<BenchmarkResultsWriter> = Vec::new();
         for result in report.get_results() {
-            let writer = BenchmarkResultsWriter::new(result)?;
+            let writer =
+                BenchmarkResultsWriter::new(result, config.slo.as_ref(), config.gpu_cost.as_ref())?;
             results.push(writer);
         }
         Ok(BenchmarkReportWriter {
@@ -169,7 +216,14 @@ impl BenchmarkReportWriter {
         Ok(())
     }
 
+    /// Every request of every step, for callers that keep the raw responses.
+    pub fn benchmark_report(&self) -> &BenchmarkReport {
+        &self.report
+    }
+
+    #[cfg(feature = "cli")]
     pub async fn stdout(&self) -> anyhow::Result<()> {
+        use crate::table;
         let param_table = table::parameters_table(self.config.clone())?;
         println!("\n{param_table}\n");
         let results_table = table::results_table(self.report.clone())?;

@@ -1,29 +1,34 @@
 use crate::executors::{
     ConstantArrivalRateExecutor, ConstantVUsExecutor, Executor, ExecutorConfig,
 };
+use crate::record::{RecordSink, RequestRecord};
 use crate::requests::{
     TextGenerationAggregatedResponse, TextGenerationBackend, TextRequestGenerator,
 };
 use crate::results::BenchmarkErrors::NoResponses;
 use crate::results::BenchmarkResults;
-use log::{debug, trace, warn};
+use log::{debug, trace};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{broadcast, Mutex};
 
-#[derive(Clone, strum_macros::Display)]
+#[derive(Clone, Debug, PartialEq, strum_macros::Display, Serialize, Deserialize)]
 pub enum ExecutorType {
     ConstantVUs,
     ConstantArrivalRate,
+    /// Each request of a list once, optionally at recorded times.
+    Scheduled,
 }
 
 pub struct Scheduler {
     id: String,
-    executor: Arc<Mutex<dyn Executor + Send>>,
+    executor: Arc<Mutex<Box<dyn Executor + Send>>>,
     requests_generator: Arc<Mutex<dyn TextRequestGenerator + Send>>,
     results: Arc<Mutex<BenchmarkResults>>,
     progress_tx: Sender<Option<SchedulerProgress>>,
     stop_sender: broadcast::Sender<()>,
+    records: Option<RecordSink>,
 }
 
 pub struct SchedulerProgress {
@@ -42,48 +47,70 @@ impl Scheduler {
         requests_generator: Arc<Mutex<dyn TextRequestGenerator + Send>>,
         progress_tx: Sender<Option<SchedulerProgress>>,
         stop_sender: broadcast::Sender<()>,
-    ) -> Scheduler {
-        match executor_type {
-            ExecutorType::ConstantVUs => Scheduler {
-                id: id.clone(),
-                executor: Arc::from(Mutex::from(ConstantVUsExecutor::new(
-                    backend.clone(),
+    ) -> anyhow::Result<Scheduler> {
+        let executor: Box<dyn Executor + Send> = match executor_type {
+            ExecutorType::ConstantVUs => Box::new(ConstantVUsExecutor::new(
+                backend,
+                config.max_vus,
+                config.duration,
+            )),
+            ExecutorType::ConstantArrivalRate => {
+                let rate = config.rate.ok_or_else(|| {
+                    anyhow::anyhow!("Rate must be specified for ConstantArrivalRateExecutor")
+                })?;
+                Box::new(ConstantArrivalRateExecutor::new(
+                    backend,
                     config.max_vus,
                     config.duration,
-                ))),
-                results: Arc::from(Mutex::from(BenchmarkResults::new(
-                    id.clone(),
-                    ExecutorType::ConstantVUs,
-                    config,
-                ))),
-                requests_generator,
-                progress_tx,
-                stop_sender,
-            },
-            ExecutorType::ConstantArrivalRate => {
-                if config.rate.is_none() {
-                    panic!("Rate must be specified for ConstantArrivalRateExecutor");
-                }
-                let rate = config.rate.unwrap();
-                Scheduler {
-                    id: id.clone(),
-                    executor: Arc::from(Mutex::from(ConstantArrivalRateExecutor::new(
-                        backend.clone(),
-                        config.max_vus,
-                        config.duration,
-                        rate,
-                    ))),
-                    results: Arc::from(Mutex::from(BenchmarkResults::new(
-                        id.clone(),
-                        ExecutorType::ConstantArrivalRate,
-                        config,
-                    ))),
-                    requests_generator,
-                    progress_tx,
-                    stop_sender,
-                }
+                    rate,
+                ))
             }
+            ExecutorType::Scheduled => {
+                return Err(anyhow::anyhow!(
+                    "A scheduled executor needs its requests: use Scheduler::with_executor"
+                ))
+            }
+        };
+        Ok(Self::with_executor(
+            id,
+            executor,
+            executor_type,
+            config,
+            requests_generator,
+            progress_tx,
+            stop_sender,
+        ))
+    }
+
+    /// Run any executor; `executor_type` and `config` describe it in the results.
+    pub fn with_executor(
+        id: String,
+        executor: Box<dyn Executor + Send>,
+        executor_type: ExecutorType,
+        config: ExecutorConfig,
+        requests_generator: Arc<Mutex<dyn TextRequestGenerator + Send>>,
+        progress_tx: Sender<Option<SchedulerProgress>>,
+        stop_sender: broadcast::Sender<()>,
+    ) -> Scheduler {
+        Scheduler {
+            results: Arc::from(Mutex::from(BenchmarkResults::new(
+                id.clone(),
+                executor_type,
+                config,
+            ))),
+            id,
+            executor: Arc::from(Mutex::from(executor)),
+            requests_generator,
+            progress_tx,
+            stop_sender,
+            records: None,
         }
+    }
+
+    /// Send a [`RequestRecord`] for every response.
+    pub fn with_records(mut self, records: Option<RecordSink>) -> Self {
+        self.records = records;
+        self
     }
 
     pub async fn run(&mut self) -> anyhow::Result<BenchmarkResults> {
@@ -97,30 +124,44 @@ impl Scheduler {
         let progress_tx = self.progress_tx.clone();
         let mut stop_receiver = self.stop_sender.subscribe();
         let req_gen = self.requests_generator.clone();
-        tokio::spawn(async move {
+        let expected_requests = self.executor.lock().await.expected_requests();
+        let records = self.records.clone();
+        let step_id = self.id.clone();
+        let consumer = tokio::spawn(async move {
             tokio::select! {
                 _ = stop_receiver.recv() => {
                     debug!("Received stop signal, stopping benchmark");
                 }
                 _ = async{
-                    while let Some(response) = rx.recv().await{
-                        // call generator callback
-                        let response_txt=response.response.clone();
-                        if let Some(request)= response.request.clone(){
-                            req_gen.lock().await.callback(request, response_txt.unwrap_or_default().as_str());
-                        }
-                        let result = results.clone();
-                        let progress_tx = progress_tx.clone();
+                    while let Some(mut response) = rx.recv().await{
                         trace!("Received response: {:?}", response);
                         if response.ended {
                             return;
                         }
-                        let mut result = result.lock().await;
+                        if let Some(request) = response.request.clone() {
+                            let text = response.response.clone().unwrap_or_default();
+                            if !response.failed {
+                                response.check = request.check.as_ref().map(|c| c.evaluate(&text));
+                                // a failed turn ends its conversation
+                                req_gen.lock().await.callback(request, &text);
+                            }
+                        }
+                        if let Some(sink) = &records {
+                            let record = RequestRecord::from_response(&step_id, &response, sink.include_text);
+                            let _ = sink.tx.send(record).await;
+                        }
+                        let mut result = results.lock().await;
                         result.add_response(response);
-                        let expected_duration = result.executor_config().duration.as_secs_f64();
-                        let start_time = result.start_time().unwrap_or(tokio::time::Instant::now());
+                        let progress = match expected_requests {
+                            Some(n) => 100.0 * result.total_requests() as f64 / n.max(1) as f64,
+                            None => {
+                                let expected_duration = result.executor_config().duration.as_secs_f64();
+                                let start_time = result.start_time().unwrap_or(tokio::time::Instant::now());
+                                100.0 * (1.0 - (expected_duration - start_time.elapsed().as_secs_f64()) / expected_duration)
+                            }
+                        };
                         let _ = progress_tx.send(Some(SchedulerProgress {
-                            progress: (100.0 * (1.0 - (expected_duration - start_time.elapsed().as_secs_f64()) / expected_duration)).min(100.0),
+                            progress: progress.min(100.0),
                             requests_throughput: result.successful_request_rate().unwrap_or_default(),
                             successful_requests: result.successful_requests() as u64,
                             failed_requests: result.failed_requests() as u64,
@@ -138,16 +179,15 @@ impl Scheduler {
                 self.stop_sender.clone(),
             )
             .await;
-        warn!("{:?}", self.results.clone());
-        if self.results.lock().await.successful_requests() == 0 {
+        // every executor ends with an `ended` marker, or the run was stopped
+        let _ = consumer.await;
+        let results = self.results.lock().await.clone();
+        debug!("{:?}", results);
+        if results.successful_requests() == 0 {
             Err(anyhow::anyhow!(NoResponses))
         } else {
-            Ok(self.results.lock().await.clone())
+            Ok(results)
         }
-    }
-
-    pub fn get_results(&self) -> Arc<Mutex<BenchmarkResults>> {
-        self.results.clone()
     }
 }
 
@@ -156,7 +196,6 @@ mod tests {
     use super::*;
     use crate::requests::OpenAITextGenerationBackend;
     use std::time::Duration;
-    use tokenizers::Tokenizer;
     use tokio::time;
 
     #[tokio::test]
@@ -181,7 +220,8 @@ mod tests {
             requests_generator,
             progress_tx,
             stop_sender,
-        );
+        )
+        .unwrap();
         let results = scheduler.run().await.unwrap();
         assert_eq!(results.successful_requests(), 180); // 20 requests per second for 10 seconds - 20 requests for last second as the backend has a 1 second delay
     }
@@ -208,7 +248,8 @@ mod tests {
             requests_generator,
             progress_tx,
             stop_sender,
-        );
+        )
+        .unwrap();
         let results = scheduler.run().await.unwrap();
         assert!(
             results.successful_requests() > 7200,
@@ -233,7 +274,7 @@ mod tests {
             })
             .create_async().await;
         let url = s.url().parse().unwrap();
-        let tokenizer = Arc::new(Tokenizer::from_pretrained("gpt2", None).unwrap());
+        let tokenizer = crate::test_util::tokenizer();
         let backend = OpenAITextGenerationBackend::try_new(
             "".to_string(),
             url,
@@ -257,7 +298,8 @@ mod tests {
             requests_generator,
             progress_tx,
             stop_sender,
-        );
+        )
+        .unwrap();
         let results = scheduler.run().await.unwrap();
         assert_eq!(results.successful_requests(), 475); // 25 expected missing requests due to the 500ms delay in the backend
     }

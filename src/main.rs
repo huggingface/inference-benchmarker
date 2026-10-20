@@ -1,6 +1,6 @@
 use clap::error::ErrorKind::InvalidValue;
 use clap::{ArgGroup, Error, Parser};
-use inference_benchmarker::{run, RunConfiguration, TokenizeOptions};
+use inference_benchmarker::{hub, run, RunConfiguration, TokenizeOptions};
 use log::{debug, error};
 use reqwest::Url;
 use std::collections::HashMap;
@@ -178,7 +178,9 @@ async fn main() {
         git_sha
     );
 
-    let (stop_sender, _) = broadcast::channel(1);
+    // set process system limits
+    sysinfo::set_open_files_limit(0);
+    let (stop_sender, _) = broadcast::channel(16);
     // handle ctrl-c
     let stop_sender_clone = stop_sender.clone();
     tokio::spawn(async move {
@@ -194,11 +196,7 @@ async fn main() {
     let stop_sender_clone = stop_sender.clone();
     // get HF token
     let token_env_key = "HF_TOKEN".to_string();
-    let cache = hf_hub::Cache::from_env();
-    let hf_token = match std::env::var(token_env_key).ok() {
-        Some(token) => Some(token),
-        None => cache.token(),
-    };
+    let hf_token = std::env::var(token_env_key).ok().or_else(hub::stored_token);
     let model_name = args
         .model_name
         .clone()

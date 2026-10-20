@@ -1,8 +1,11 @@
 use crate::executors::ExecutorConfig;
-use crate::requests::TextGenerationAggregatedResponse;
+use crate::requests::{ErrorKind, TextGenerationAggregatedResponse};
 use crate::results::BenchmarkErrors::NoResponses;
 use crate::scheduler::ExecutorType;
+use crate::slo::{Slo, SloResult};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::time::Duration;
 
@@ -89,17 +92,89 @@ impl BenchmarkResults {
     }
 
     pub fn total_tokens_sent(&self) -> u64 {
-        self.get_successful_responses()
-            .iter()
-            .map(|response| response.request.clone().unwrap().num_prompt_tokens)
-            .sum()
+        self.total_prompt_tokens()
     }
 
     pub fn total_prompt_tokens(&self) -> u64 {
         self.get_successful_responses()
             .iter()
-            .map(|response| response.request.clone().unwrap().num_prompt_tokens)
+            .map(|response| response.prompt_tokens())
             .sum()
+    }
+
+    pub fn output_tokens_avg(&self) -> f64 {
+        match self.successful_requests() {
+            0 => 0.0,
+            n => self.total_tokens() as f64 / n as f64,
+        }
+    }
+
+    /// Share of requests that failed, from 0 to 1.
+    pub fn error_rate(&self) -> f64 {
+        self.share(|r| r.failed)
+    }
+
+    /// Share of requests that timed out, from 0 to 1.
+    pub fn timeout_rate(&self) -> f64 {
+        self.share(|r| {
+            r.error
+                .as_ref()
+                .is_some_and(|e| e.kind == ErrorKind::Timeout)
+        })
+    }
+
+    pub fn errors_by_kind(&self) -> BTreeMap<ErrorKind, u64> {
+        let mut counts = BTreeMap::new();
+        for error in self
+            .aggregated_responses
+            .iter()
+            .filter_map(|r| r.error.as_ref())
+        {
+            *counts.entry(error.kind).or_default() += 1;
+        }
+        counts
+    }
+
+    /// Score of the requests that carry a check; a failed request counts as wrong.
+    pub fn accuracy(&self) -> Option<AccuracyResult> {
+        let checked: Vec<_> = self
+            .aggregated_responses
+            .iter()
+            .filter(|r| r.request.as_ref().is_some_and(|q| q.check.is_some()))
+            .collect();
+        if checked.is_empty() {
+            return None;
+        }
+        let passed = checked
+            .iter()
+            .filter(|r| r.check.as_ref().is_some_and(|c| c.passed))
+            .count() as u64;
+        Some(AccuracyResult {
+            checked: checked.len() as u64,
+            passed,
+            accuracy: passed as f64 / checked.len() as f64,
+        })
+    }
+
+    pub fn slo(&self, slo: &Slo) -> SloResult {
+        let good = self
+            .aggregated_responses
+            .iter()
+            .filter(|r| slo.is_good(r))
+            .count() as u64;
+        slo.result(
+            good,
+            self.total_requests() as u64,
+            self.error_rate(),
+            self.duration().unwrap_or_default().as_secs_f64(),
+        )
+    }
+
+    fn share(&self, pred: impl Fn(&TextGenerationAggregatedResponse) -> bool) -> f64 {
+        match self.total_requests() {
+            0 => 0.0,
+            n => self.aggregated_responses.iter().filter(|r| pred(r)).count() as f64 / n as f64,
+        }
     }
 
     pub fn prompt_tokens_avg(&self) -> anyhow::Result<f64> {
@@ -307,7 +382,14 @@ impl Debug for BenchmarkResults {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AccuracyResult {
+    pub checked: u64,
+    pub passed: u64,
+    pub accuracy: f64,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct BenchmarkReport {
     results: Vec<BenchmarkResults>,
     start_time: Option<chrono::DateTime<Utc>>,
@@ -360,6 +442,7 @@ mod test {
             prompt: "test".to_string(),
             num_prompt_tokens: 10,
             num_decode_tokens: None,
+            ..Default::default()
         });
         let mut response1 = TextGenerationAggregatedResponse::new(request.clone());
         response1.start_time = Some(tokio::time::Instant::now());
@@ -448,6 +531,7 @@ mod test {
             prompt: "test".to_string(),
             num_prompt_tokens: 10,
             num_decode_tokens: None,
+            ..Default::default()
         });
         let mut response = TextGenerationAggregatedResponse::new(request);
         response.start_time = Some(tokio::time::Instant::now());
