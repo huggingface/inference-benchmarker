@@ -1,8 +1,8 @@
+use crate::checks::{Check, CheckOutcome};
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use hf_hub::api::sync::ApiBuilder;
-use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, error, info, trace, warn};
+use rand::Rng;
 use rand_distr::Distribution;
 use rayon::iter::split;
 use rayon::prelude::*;
@@ -12,20 +12,42 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::fmt::Display;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time;
-use tokenizers::{FromPretrainedParameters, Tokenizer};
+use tokenizers::Tokenizer;
 use tokio::sync::mpsc::Sender;
-use tokio::time::{sleep, Instant};
+use tokio::time::Instant;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TextGenerationRequest {
+    /// Id of the next turn of the same conversation, if any.
     pub id: Option<Uuid>,
+    /// The new user message.
     pub prompt: String,
+    /// Prompt tokens, including `history`.
     pub num_prompt_tokens: u64,
     pub num_decode_tokens: Option<u64>,
+    /// Messages sent before `prompt`: the system prompt and earlier turns.
+    pub history: Vec<OpenAITextGenerationMessage>,
+    pub conversation_id: Option<String>,
+    /// 0-based user turn within the conversation.
+    pub turn: u32,
+    /// Scores the answer (accuracy and conversation benchmarks).
+    pub check: Option<Check>,
+    /// When to send it, measured from the start of a replay.
+    pub offset: Option<time::Duration>,
+}
+
+impl TextGenerationRequest {
+    /// The chat messages sent to the server.
+    pub fn messages(&self) -> Vec<OpenAITextGenerationMessage> {
+        let mut messages = self.history.clone();
+        if !self.prompt.is_empty() {
+            messages.push(OpenAITextGenerationMessage::new("user", &self.prompt));
+        }
+        messages
+    }
 }
 
 #[async_trait]
@@ -59,17 +81,27 @@ impl Clone for Box<dyn TextGenerationBackend + Send + Sync> {
 #[derive(Debug, Clone)]
 pub struct OpenAITextGenerationBackend {
     pub api_key: String,
-    pub base_url: Url,
+    /// The server URL + `v1/chat/completions`, keeping any path prefix.
+    pub endpoint: Url,
     pub model_name: String,
     pub client: reqwest::Client,
     pub tokenizer: Arc<Tokenizer>,
     pub timeout: time::Duration,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq)]
 pub struct OpenAITextGenerationMessage {
     pub content: String,
     pub role: String,
+}
+
+impl OpenAITextGenerationMessage {
+    pub fn new(role: &str, content: &str) -> Self {
+        Self {
+            role: role.to_string(),
+            content: content.to_string(),
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -84,9 +116,27 @@ pub struct OpenAITextGenerationChoice {
     pub delta: Option<OpenAITextGenerationDelta>,
 }
 
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct OpenAIUsage {
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+}
+
 #[derive(Deserialize, Serialize, Clone)]
 pub struct OpenAITextGenerationResponse {
+    #[serde(default)]
     pub choices: Vec<OpenAITextGenerationChoice>,
+    #[serde(default)]
+    pub usage: Option<OpenAIUsage>,
+    #[serde(default)]
+    pub error: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct OpenAIStreamOptions {
+    pub include_usage: bool,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -97,6 +147,18 @@ pub struct OpenAITextGenerationRequest {
     pub stream: bool,
     pub stop: Option<String>,
     pub temperature: f64,
+    /// Asks the server for exact token counts in the last chunk.
+    pub stream_options: OpenAIStreamOptions,
+}
+
+/// `base` + `v1/chat/completions`, keeping any path prefix of `base`.
+pub fn chat_completions_url(base: &Url) -> anyhow::Result<Url> {
+    let mut base = base.clone();
+    if !base.path().ends_with('/') {
+        let path = format!("{}/", base.path());
+        base.set_path(&path);
+    }
+    Ok(base.join("v1/chat/completions")?)
 }
 
 impl OpenAITextGenerationBackend {
@@ -114,11 +176,20 @@ impl OpenAITextGenerationBackend {
         Ok(Self {
             client,
             api_key,
-            base_url,
+            endpoint: chat_completions_url(&base_url)?,
             model_name,
             tokenizer,
             timeout,
         })
+    }
+
+    fn count_tokens(&self, text: &str) -> u64 {
+        // a delta may hold several tokens (vLLM chunked prefill, speculative decoding)
+        self.tokenizer
+            .encode(text, false)
+            .map(|e| e.len() as u64)
+            .unwrap_or(1)
+            .max(1)
     }
 }
 
@@ -129,35 +200,39 @@ impl TextGenerationBackend for OpenAITextGenerationBackend {
         request: Arc<TextGenerationRequest>,
         sender: Sender<TextGenerationAggregatedResponse>,
     ) {
-        let mut url = self.base_url.clone();
-        url.set_path("/v1/chat/completions");
-        // let url = format!("{base_url}", base_url = self.base_url);
         let mut aggregated_response = TextGenerationAggregatedResponse::new(request.clone());
-        let messages = vec![OpenAITextGenerationMessage {
-            role: "user".to_string(),
-            content: request.prompt.clone(),
-        }];
         let body = OpenAITextGenerationRequest {
             model: self.model_name.clone(),
-            messages,
+            messages: request.messages(),
             max_tokens: request.num_decode_tokens,
             stream: true,
             stop: None,
             temperature: 0.0,
+            stream_options: OpenAIStreamOptions {
+                include_usage: true,
+            },
         };
         let req = self
             .client
-            .post(url)
+            .post(self.endpoint.clone())
             .header(
                 "Authorization",
                 format!("Bearer {token}", token = self.api_key),
             )
-            .json(&serde_json::json!(body))
+            .json(&body)
             .timeout(self.timeout);
         // start timer
         aggregated_response.start();
-        let mut es = EventSource::new(req).unwrap();
-        let mut final_response = "".to_string();
+        let mut es = match EventSource::new(req) {
+            Ok(es) => es,
+            Err(e) => {
+                aggregated_response.fail(RequestError::new(ErrorKind::Connection, e.to_string()));
+                let _ = sender.send(aggregated_response).await;
+                return;
+            }
+        };
+        let mut final_response = String::new();
+        let mut usage_tokens = None;
         while let Some(event) = es.next().await {
             match event {
                 Ok(Event::Open) => trace!("SSE connection opened"),
@@ -166,117 +241,104 @@ impl TextGenerationBackend for OpenAITextGenerationBackend {
                         aggregated_response.stop();
                         continue;
                     }
-                    if message.data.starts_with("{\"error\":") {
-                        error!("Error from OpenAI API: {message}", message = message.data);
-                        aggregated_response.fail();
-                        es.close();
-                        break;
-                    }
-                    // deserialize message data
                     let oai_response: OpenAITextGenerationResponse =
                         match serde_json::from_str(&message.data) {
                             Ok(response) => response,
                             Err(e) => {
-                                error!("Error deserializing OpenAI API response: {e}", e = e);
-                                aggregated_response.fail();
+                                error!("Error deserializing OpenAI API response: {e}");
+                                aggregated_response
+                                    .fail(RequestError::new(ErrorKind::Decode, e.to_string()));
                                 es.close();
                                 break;
                             }
                         };
-                    let choices = oai_response.choices;
-                    let content = choices[0]
-                        .clone()
-                        .delta
-                        .unwrap()
-                        .content
-                        .unwrap_or("".to_string());
-                    if content.is_empty() {
-                        // skip empty responses
+                    if let Some(err) = oai_response.error {
+                        error!("Error from OpenAI API: {err}");
+                        aggregated_response
+                            .fail(RequestError::new(ErrorKind::Api, err.to_string()));
+                        es.close();
+                        break;
+                    }
+                    if let Some(usage) = oai_response.usage {
+                        usage_tokens = Some(usage);
+                    }
+                    // the usage chunk has no choices
+                    let Some(choice) = oai_response.choices.first() else {
                         continue;
-                    }
-                    // we need to count the number of tokens generated as each delta chunk may contain multiple tokens
-                    // that's the case with vLLM chunked prefill or speculative decoding
-                    let num_tokens =
-                        self.tokenizer.encode(content.clone(), false).unwrap().len() as u64;
-                    if num_tokens > 1 {
-                        warn!(
-                            "Generated more than one token: {num_tokens}",
-                            num_tokens = num_tokens
-                        );
-                    }
-                    match choices[0].clone().finish_reason {
-                        None => {
-                            aggregated_response.add_tokens(num_tokens);
-                            final_response += content.as_str();
-                        }
-                        Some(_) => {
-                            aggregated_response.add_tokens(num_tokens);
-                            aggregated_response.stop();
-                            trace!("Generated text using OpenAI API | prompt: {prompt}, max tokens: {max_tokens:?}, response: {message}", prompt = request.prompt, max_tokens = request.num_decode_tokens,message = &content);
-                        }
                     };
+                    let content = choice
+                        .delta
+                        .as_ref()
+                        .and_then(|d| d.content.clone())
+                        .unwrap_or_default();
+                    if !content.is_empty() {
+                        aggregated_response.add_tokens(self.count_tokens(&content));
+                        final_response += content.as_str();
+                    }
+                    if choice.finish_reason.is_some() {
+                        aggregated_response.stop();
+                        trace!("Generated text using OpenAI API | prompt: {prompt}, max tokens: {max_tokens:?}, response: {final_response}", prompt = request.prompt, max_tokens = request.num_decode_tokens);
+                    }
                 }
                 Err(e) => {
                     match e {
-                        Error::Utf8(_) => {
-                            aggregated_response.fail();
-                        }
-                        Error::Parser(_) => {
-                            aggregated_response.fail();
-                        }
-                        Error::Transport(_) => {
-                            aggregated_response.fail();
-                        }
-                        Error::InvalidContentType(_, _) => {
-                            aggregated_response.fail();
-                        }
-                        Error::InvalidStatusCode(_, _) => {
-                            aggregated_response.fail();
-                        }
-                        Error::InvalidLastEventId(_) => {
-                            aggregated_response.fail();
-                        }
                         Error::StreamEnded => {
                             if aggregated_response.num_generated_tokens == 0 {
-                                // server sent no data
-                                aggregated_response.fail();
-                            }
-                            if aggregated_response.end_time.is_none() {
+                                aggregated_response.fail(RequestError::new(
+                                    ErrorKind::Stream,
+                                    "server sent no tokens".to_string(),
+                                ));
+                            } else if aggregated_response.end_time.is_none() {
                                 // server closed the connection before we received the final response
-                                warn!("Connection closed before completion. Received :: {num_tokens}/{max_tokens} tokens. Response: {final_response}", num_tokens = aggregated_response.num_generated_tokens, max_tokens = request.num_decode_tokens.unwrap_or(0));
-                                aggregated_response.fail();
+                                warn!("Connection closed before completion. Received :: {num_tokens}/{max_tokens} tokens.", num_tokens = aggregated_response.num_generated_tokens, max_tokens = request.num_decode_tokens.unwrap_or(0));
+                                aggregated_response.fail(RequestError::new(
+                                    ErrorKind::Stream,
+                                    "connection closed before completion".to_string(),
+                                ));
                             }
                         }
+                        other => aggregated_response.fail(RequestError::from_eventsource(other)),
                     }
                     es.close();
                 }
             };
         }
-        sender
-            .send(aggregated_response.clone())
-            .await
-            .expect("Error sending response to channel");
-        //debug!("Final response: {response}", response = final_response);
+        if let Some(usage) = usage_tokens {
+            if usage.completion_tokens > 0 {
+                aggregated_response.num_generated_tokens = usage.completion_tokens;
+            }
+            if usage.prompt_tokens > 0 {
+                aggregated_response.num_prompt_tokens = Some(usage.prompt_tokens);
+            }
+        }
+        aggregated_response.response = Some(final_response);
+        // the receiver is gone only when the run was stopped
+        let _ = sender.send(aggregated_response).await;
     }
 }
 
+/// A backend that answers `echo: <prompt>` after a fixed time (tests).
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct DummyTextGenerationBackend {
     time_to_generate: time::Duration,
 }
 
+#[cfg(test)]
 impl DummyTextGenerationBackend {
     pub fn new(time_to_generate: time::Duration) -> Self {
         Self { time_to_generate }
     }
 }
 
+#[cfg(test)]
 impl Default for DummyTextGenerationBackend {
     fn default() -> Self {
         Self::new(time::Duration::from_secs(1))
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl TextGenerationBackend for DummyTextGenerationBackend {
     async fn generate(
@@ -290,16 +352,14 @@ impl TextGenerationBackend for DummyTextGenerationBackend {
         let time_per_token = self
             .time_to_generate
             .checked_div(num_tokens as u32)
-            .unwrap();
+            .unwrap_or_default();
         for _ in 0..num_tokens {
-            sleep(time_per_token).await;
+            tokio::time::sleep(time_per_token).await;
             response.add_tokens(1);
         }
         response.stop();
-        sender
-            .send(response.clone())
-            .await
-            .expect("Error sending response to channel");
+        response.response = Some(format!("echo: {}", request.prompt));
+        let _ = sender.send(response).await;
     }
 }
 
@@ -309,19 +369,22 @@ pub trait TextRequestGenerator: Sync {
     fn callback(&mut self, request: Arc<TextGenerationRequest>, response: &str);
 }
 
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct Conversation {
     pub role: String,
     pub content: String,
+    /// On a user turn: scores the model's answer to that turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<Check>,
 }
 
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ConversationEntry {
     pub id: String,
     pub conversations: Vec<Conversation>,
 }
 
-#[derive(Clone, Serialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct TokenizeOptions {
     pub num_tokens: Option<u64>,
     pub min_tokens: u64,
@@ -337,6 +400,13 @@ impl TokenizeOptions {
             max_tokens: u64::MAX,
             variance: 0,
         }
+    }
+
+    /// Draw a token count, or `None` when no target is set.
+    pub fn sample(&self) -> Option<u64> {
+        self.num_tokens.map(|num_tokens| {
+            sample_num_tokens(num_tokens, self.min_tokens, self.max_tokens, self.variance)
+        })
     }
 }
 
@@ -359,8 +429,9 @@ impl Display for TokenizeOptions {
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct ConversationTurnRequest {
+    #[allow(dead_code)] // tests rebuild conversations by it
     id: Uuid,
     priority: u64,
     tie: Instant,
@@ -383,6 +454,14 @@ impl PartialOrd for ConversationTurnRequest {
     }
 }
 
+impl PartialEq for ConversationTurnRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for ConversationTurnRequest {}
+
 #[derive(Clone)]
 pub struct ConversationTextRequestGenerator {
     pub requests: HashMap<Uuid, ConversationTurnRequest>,
@@ -391,182 +470,166 @@ pub struct ConversationTextRequestGenerator {
 }
 
 impl ConversationTextRequestGenerator {
-    /// Load a conversation dataset from a JSON file
-    /// The JSON file should be an array of objects, each object representing a conversation entry
-    /// Each conversation entry should have an `id` field and a `conversations` field
-    /// The `conversations` field should be an array of objects, each object representing a turn in the conversation
-    /// Each turn should have a `role` field and a `content` field
-    /// The `role` field should be either "user" or "system"
-    /// The `content` field should be the text of the turn
-    /// All conversation turns are tokenized and converted into `TextGenerationRequest`. The `id` field is used to link turns in the conversation,
-    /// so that each `TextGenerationRequest` has a reference to the next turn in the conversation.
+    #[cfg(feature = "cli")]
+    /// Load a conversation dataset from a JSON file: an array of
+    /// [`ConversationEntry`] (`{id, conversations: [{role, content, check?}]}`).
     pub fn load(
-        filepath: PathBuf,
-        tokenizer: String,
+        filepath: std::path::PathBuf,
+        tokenizer: Arc<Tokenizer>,
         prompt_tokenize_opts: Option<TokenizeOptions>,
         decode_tokenize_opts: Option<TokenizeOptions>,
-        hf_token: Option<String>,
     ) -> anyhow::Result<Self> {
-        let params = FromPretrainedParameters {
-            token: hf_token,
-            ..Default::default()
-        };
-        let tokenizer = match Tokenizer::from_pretrained(tokenizer, Some(params)) {
-            Ok(tokenizer) => tokenizer,
-            Err(e) => {
-                return Err(anyhow::anyhow!("Error loading tokenizer: {e}"));
-            }
-        };
-        let tokenizer = Arc::new(tokenizer);
-        // load json file
         let input = std::fs::read_to_string(&filepath)?;
-        let data: Vec<ConversationEntry> = serde_json::from_str(&input).expect("Unable to parse input file. Check that it is valid JSON and matches the expected format.");
-        // generate requests
-        let requests: Arc<Mutex<HashMap<Uuid, ConversationTurnRequest>>> =
-            Arc::from(Mutex::from(HashMap::new()));
+        let data: Vec<ConversationEntry> = serde_json::from_str(&input).map_err(|e| {
+            anyhow::anyhow!("{}: not a list of conversations: {e}", filepath.display())
+        })?;
         info!(
             "Generating requests from {filepath}",
             filepath = filepath.display()
         );
-        let bar = ProgressBar::new(data.len() as u64);
-        bar.set_style(ProgressStyle::with_template(
-            "Tokenizing prompts [{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}",
-        )?);
+        Self::from_entries(data, tokenizer, prompt_tokenize_opts, decode_tokenize_opts)
+    }
+
+    /// Build the generator from conversations already in memory.
+    ///
+    /// Leading `system` messages become the history of the first turn. Every
+    /// `user` message becomes one request; the dataset's `assistant` messages
+    /// are dropped, because the model under test writes its own. The `id`
+    /// field links each turn to the next one in the conversation.
+    pub fn from_entries(
+        data: Vec<ConversationEntry>,
+        tokenizer: Arc<Tokenizer>,
+        prompt_tokenize_opts: Option<TokenizeOptions>,
+        decode_tokenize_opts: Option<TokenizeOptions>,
+    ) -> anyhow::Result<Self> {
+        let prompt_opts = prompt_tokenize_opts.unwrap_or_default();
+        let requests: Arc<Mutex<HashMap<Uuid, ConversationTurnRequest>>> =
+            Arc::from(Mutex::from(HashMap::new()));
         split(data, entry_splitter).for_each(|subrange| {
             for entry in subrange {
-                bar.inc(1);
-                if entry.conversations.is_empty() {
-                    continue;
-                }
-                let ids = (0..entry.conversations.len())
-                    .map(|_| Uuid::new_v4())
-                    .collect::<Vec<Uuid>>();
-                let filtered_conversations = entry
+                let system: Vec<OpenAITextGenerationMessage> = entry
                     .conversations
                     .iter()
-                    .filter(|c| c.role == "user" || c.role == "system")
-                    .collect::<Vec<&Conversation>>();
-                for (turn_idx, c) in filtered_conversations.iter().enumerate() {
-                    let prompt = c.content.clone();
-                    let num_decode_tokens = decode_tokenize_opts.clone().map_or_else(
-                        || None,
-                        |opts| {
-                            opts.num_tokens.map(|num_tokens| {
-                                sample_num_tokens(
-                                    num_tokens,
-                                    opts.min_tokens,
-                                    opts.max_tokens,
-                                    opts.variance,
-                                )
-                            })
+                    .take_while(|c| c.role == "system")
+                    .map(|c| OpenAITextGenerationMessage::new("system", &c.content))
+                    .collect();
+                let system_tokens: u64 = system
+                    .iter()
+                    .map(|m| count_tokens(&tokenizer, &m.content))
+                    .sum();
+                let turns: Vec<&Conversation> = entry
+                    .conversations
+                    .iter()
+                    .filter(|c| c.role == "user")
+                    .collect();
+                let ids: Vec<Uuid> = turns.iter().map(|_| Uuid::new_v4()).collect();
+                for (turn_idx, c) in turns.iter().enumerate() {
+                    debug!("Prompt: {prompt}", prompt = c.content);
+                    let (prompt, num_tokens) =
+                        match tokenize_prompt(c.content.clone(), tokenizer.clone(), &prompt_opts) {
+                            Ok(prompt) => prompt,
+                            Err(e) => {
+                                // later turns cannot be reached without this one
+                                debug!("Skipping rest of conversation {}: {e}", entry.id);
+                                break;
+                            }
+                        };
+                    let first = turn_idx == 0;
+                    requests.lock().expect("requests lock").insert(
+                        ids[turn_idx],
+                        ConversationTurnRequest {
+                            id: ids[turn_idx],
+                            priority: turn_idx as u64,
+                            tie: Instant::now(),
+                            request: TextGenerationRequest {
+                                id: ids.get(turn_idx + 1).copied(),
+                                prompt,
+                                num_prompt_tokens: num_tokens
+                                    + if first { system_tokens } else { 0 },
+                                num_decode_tokens: decode_tokenize_opts
+                                    .as_ref()
+                                    .and_then(TokenizeOptions::sample),
+                                history: if first { system.clone() } else { Vec::new() },
+                                conversation_id: Some(entry.id.clone()),
+                                turn: turn_idx as u32,
+                                check: c.check.clone(),
+                                offset: None,
+                            },
                         },
                     );
-                    let next_id = if turn_idx == entry.conversations.len() - 1 {
-                        None
-                    } else {
-                        Some(ids[turn_idx + 1]) // link to next turn in the conversation
-                    };
-                    debug!("Prompt: {prompt}", prompt = prompt);
-                    match &prompt_tokenize_opts {
-                        None => {
-                            let (_, num_tokens) = match tokenize_prompt(
-                                prompt.clone(),
-                                tokenizer.clone(),
-                                &TokenizeOptions::default(),
-                            ) {
-                                Ok((prompt, num_tokens)) => (prompt, num_tokens),
-                                Err(e) => {
-                                    debug!("Error tokenizing prompt: {e}");
-                                    return;
-                                }
-                            };
-                            requests.lock().unwrap().insert(
-                                ids[turn_idx],
-                                ConversationTurnRequest {
-                                    id: ids[turn_idx],
-                                    priority: turn_idx as u64,
-                                    tie: Instant::now(),
-                                    request: TextGenerationRequest {
-                                        id: next_id,
-                                        prompt,
-                                        num_prompt_tokens: num_tokens,
-                                        num_decode_tokens,
-                                    },
-                                },
-                            );
-                        }
-                        Some(options) => {
-                            // compute number of tokens to generate using a Gaussian distribution
-                            let (sampled_prompt, prompt_tokens) =
-                                match tokenize_prompt(prompt.clone(), tokenizer.clone(), options) {
-                                    Ok(prompt) => prompt,
-                                    Err(e) => {
-                                        debug!("Error tokenizing prompt: {e}");
-                                        return;
-                                    }
-                                };
-                            requests.lock().unwrap().insert(
-                                ids[turn_idx],
-                                ConversationTurnRequest {
-                                    id: ids[turn_idx],
-                                    tie: Instant::now(),
-                                    priority: turn_idx as u64,
-                                    request: TextGenerationRequest {
-                                        id: next_id,
-                                        prompt: sampled_prompt,
-                                        num_prompt_tokens: prompt_tokens,
-                                        num_decode_tokens,
-                                    },
-                                },
-                            );
-                        }
-                    }
                 }
-                // TODO: check that we have enough requests
             }
         });
-        let requests = requests.lock().unwrap();
+        let requests = std::mem::take(&mut *requests.lock().expect("requests lock"));
         info!(
             "Generated {num_requests} requests",
             num_requests = requests.len()
         );
         // create the queue from the hashmap. Only queue first turns in the conversation
-        let queue = BinaryHeap::from(
-            requests
-                .values()
-                .filter(|item| item.priority == 0)
-                .cloned()
-                .collect::<Vec<ConversationTurnRequest>>(),
-        );
+        let queue: BinaryHeap<ConversationTurnRequest> = requests
+            .values()
+            .filter(|item| item.priority == 0)
+            .cloned()
+            .collect();
+        if queue.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No usable prompts: every conversation was filtered out by the prompt options"
+            ));
+        }
         Ok(Self {
-            requests: requests.clone(),
+            requests,
             tokenizer,
             queue,
         })
     }
+}
 
-    pub fn download_dataset(
-        repo_name: String,
-        filename: String,
-        hf_token: Option<String>,
-    ) -> anyhow::Result<PathBuf> {
-        let api = ApiBuilder::from_env().with_token(hf_token).build()?;
-        let repo = api.dataset(repo_name);
-        let dataset = repo.get(&filename)?;
-        Ok(dataset)
+impl ConversationTextRequestGenerator {
+    /// Every conversation as its turns in order, for runs that send each
+    /// conversation once (each turn then carries the model's earlier answers).
+    pub fn chains(&self) -> Vec<Vec<TextGenerationRequest>> {
+        let mut firsts: Vec<&ConversationTurnRequest> =
+            self.requests.values().filter(|t| t.priority == 0).collect();
+        // dataset order is lost in the map: order by conversation id for a stable run
+        firsts.sort_by(|a, b| a.request.conversation_id.cmp(&b.request.conversation_id));
+        firsts
+            .into_iter()
+            .map(|first| {
+                let mut chain = vec![first.request.clone()];
+                while let Some(next) = chain
+                    .last()
+                    .and_then(|t| t.id)
+                    .and_then(|id| self.requests.get(&id))
+                {
+                    chain.push(next.request.clone());
+                }
+                chain
+            })
+            .collect()
     }
 }
 
+fn count_tokens(tokenizer: &Tokenizer, text: &str) -> u64 {
+    tokenizer
+        .encode(text, false)
+        .map(|e| e.len() as u64)
+        .unwrap_or_default()
+}
+
+/// Tokens of every message of a request: used when the caller did not count them.
+pub fn count_request_tokens(tokenizer: &Tokenizer, request: &TextGenerationRequest) -> u64 {
+    request
+        .messages()
+        .iter()
+        .map(|m| count_tokens(tokenizer, &m.content))
+        .sum()
+}
+
 fn sample_num_tokens(num_tokens: u64, min_tokens: u64, max_tokens: u64, variance: u64) -> u64 {
-    let normal = rand_distr::Normal::new(num_tokens as f64, variance as f64).unwrap();
-    let mut num_tokens = normal.sample(&mut rand::rng()) as u64;
-    if num_tokens < min_tokens {
-        num_tokens = min_tokens;
-    }
-    if num_tokens > max_tokens {
-        num_tokens = max_tokens;
-    }
-    num_tokens
+    let sampled = rand_distr::Normal::new(num_tokens as f64, variance as f64)
+        .map(|normal| normal.sample(&mut rand::rng()))
+        .unwrap_or(num_tokens as f64);
+    (sampled.max(0.0) as u64).clamp(min_tokens, max_tokens.max(min_tokens))
 }
 
 fn entry_splitter(
@@ -584,7 +647,8 @@ fn entry_splitter(
 
 impl TextRequestGenerator for ConversationTextRequestGenerator {
     fn generate_request(&mut self) -> TextGenerationRequest {
-        let item = self.queue.pop().expect("Queue is empty");
+        // never empty: first turns are pushed back, and `from_entries` rejects an empty queue
+        let item = self.queue.pop().expect("conversation queue is never empty");
         // add the item back to the end of the queue if it is a first turn in the conversation
         if item.priority == 0 {
             let mut cloned_item = item.clone();
@@ -594,79 +658,153 @@ impl TextRequestGenerator for ConversationTextRequestGenerator {
         item.request
     }
 
-    /// Use callback to add a new chat turn to the queue.
-    /// The turn is generated from the `TextGenerationRequest`, using the `id` field to link it to
-    /// the next turn in the conversation.
+    /// Use callback to add the next chat turn to the queue.
+    /// The next turn is sent with the whole conversation so far as history:
+    /// earlier user turns and the model's own answers.
     /// Those turns must be scheduled as soon as possible so that we may benefit from
     /// KV cache hits. The `priority` field is used to move the turn to the front of the queue.
     fn callback(&mut self, request: Arc<TextGenerationRequest>, response: &str) {
-        // retrieve current turn id
-        let id = match request.id {
-            None => {
-                return;
-            }
-            Some(id) => id,
+        let Some(id) = request.id else {
+            return;
         };
-        // retrieve next turn from id
-        let next_request = match self.requests.get(&id) {
-            None => {
-                return;
-            }
-            Some(request) => request,
+        let Some(next) = self.requests.get(&id) else {
+            return;
         };
-        // create a new turn with the prompt concatenated with the response and next turn's prompt
-        // and add the next turn id to the new turn
-        let new_prompt =
-            request.prompt.clone() + "\n" + response + "\n" + next_request.request.prompt.as_str();
-        // tokenize the prompt
-        let (prompt, num_tokens) = match tokenize_prompt(
-            new_prompt.to_string(),
-            self.tokenizer.clone(),
-            &TokenizeOptions::default(),
-        ) {
-            Ok((prompt, num_tokens)) => (prompt, num_tokens),
-            Err(_) => {
-                return;
-            }
-        };
-        let next_id = next_request.request.id;
         let turn = ConversationTurnRequest {
             id,
             priority: 100,       // move to the front of the queue
             tie: Instant::now(), // use the current time as tie-breaking (older turns have higher priority)
-            request: TextGenerationRequest {
-                id: next_id,
-                prompt,
-                num_prompt_tokens: num_tokens,
-                num_decode_tokens: request.num_decode_tokens, // decode tokens do not change between turns
-            },
+            request: continue_conversation(
+                &request,
+                request.num_prompt_tokens,
+                response,
+                count_tokens(&self.tokenizer, response),
+                &next.request,
+            ),
         };
-        //debug!("Adding new turn to queue: {turn}", turn = turn.request.prompt);
         self.queue.push(turn);
     }
 }
 
+/// The next turn of a conversation: `next` sent with the conversation so far
+/// (`previous`'s messages and the model's answer) as history.
+pub fn continue_conversation(
+    previous: &TextGenerationRequest,
+    previous_prompt_tokens: u64,
+    response: &str,
+    response_tokens: u64,
+    next: &TextGenerationRequest,
+) -> TextGenerationRequest {
+    let mut history = previous.messages();
+    history.push(OpenAITextGenerationMessage::new("assistant", response));
+    TextGenerationRequest {
+        history,
+        num_prompt_tokens: previous_prompt_tokens + response_tokens + next.num_prompt_tokens,
+        num_decode_tokens: previous.num_decode_tokens, // decode tokens do not change between turns
+        ..next.clone()
+    }
+}
+
+/// Cycles through a fixed list of requests: prompt lists, accuracy items, and
+/// the warmup of replay runs.
+pub struct RequestListGenerator {
+    requests: Vec<TextGenerationRequest>,
+    next: usize,
+}
+
+impl RequestListGenerator {
+    pub fn new(requests: Vec<TextGenerationRequest>) -> anyhow::Result<Self> {
+        if requests.is_empty() {
+            return Err(anyhow::anyhow!("The request list is empty"));
+        }
+        Ok(Self { requests, next: 0 })
+    }
+}
+
+impl TextRequestGenerator for RequestListGenerator {
+    fn generate_request(&mut self) -> TextGenerationRequest {
+        let request = self.requests[self.next].clone();
+        self.next = (self.next + 1) % self.requests.len();
+        request
+    }
+    fn callback(&mut self, _request: Arc<TextGenerationRequest>, _response: &str) {}
+}
+
+/// Random prompts of a set length, for runs without a dataset.
+///
+/// Prompts are random token ids decoded to text, so the server may count a
+/// slightly different number of tokens; the server's count wins when it sends one.
+pub struct SyntheticRequestGenerator {
+    tokenizer: Arc<Tokenizer>,
+    prompt_options: TokenizeOptions,
+    decode_options: Option<TokenizeOptions>,
+}
+
+impl SyntheticRequestGenerator {
+    pub fn new(
+        tokenizer: Arc<Tokenizer>,
+        prompt_options: TokenizeOptions,
+        decode_options: Option<TokenizeOptions>,
+    ) -> anyhow::Result<Self> {
+        if prompt_options.num_tokens.unwrap_or_default() == 0 {
+            return Err(anyhow::anyhow!(
+                "Synthetic prompts need prompt options with num_tokens > 0"
+            ));
+        }
+        Ok(Self {
+            tokenizer,
+            prompt_options,
+            decode_options,
+        })
+    }
+}
+
+impl TextRequestGenerator for SyntheticRequestGenerator {
+    fn generate_request(&mut self) -> TextGenerationRequest {
+        let num_tokens = self.prompt_options.sample().unwrap_or(1);
+        let vocab = self.tokenizer.get_vocab_size(false).max(1) as u32;
+        let mut rng = rand::rng();
+        let ids: Vec<u32> = (0..num_tokens)
+            .map(|_| rng.random_range(0..vocab))
+            .collect();
+        TextGenerationRequest {
+            prompt: self.tokenizer.decode(&ids, true).unwrap_or_default(),
+            num_prompt_tokens: num_tokens,
+            num_decode_tokens: self
+                .decode_options
+                .as_ref()
+                .and_then(TokenizeOptions::sample),
+            ..Default::default()
+        }
+    }
+    fn callback(&mut self, _request: Arc<TextGenerationRequest>, _response: &str) {}
+}
+
+#[cfg(test)]
 pub struct DummyTextRequestGenerator {}
 
+#[cfg(test)]
 impl DummyTextRequestGenerator {
     pub fn new() -> Self {
         Self {}
     }
 }
 
+#[cfg(test)]
 impl Default for DummyTextRequestGenerator {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(test)]
 impl TextRequestGenerator for DummyTextRequestGenerator {
     fn generate_request(&mut self) -> TextGenerationRequest {
         TextGenerationRequest {
-            id: None,
             prompt: "Hello, world!".to_string(),
             num_prompt_tokens: 2,
             num_decode_tokens: Some(10),
+            ..Default::default()
         }
     }
     fn callback(&mut self, _request: Arc<TextGenerationRequest>, _response: &str) {}
@@ -709,8 +847,77 @@ fn tokenize_prompt(
                 .take(num_tokens as usize)
                 .copied()
                 .collect::<Vec<u32>>();
-            let prompt = tokenizer.decode(&tokens, true).unwrap();
+            let prompt = tokenizer
+                .decode(&tokens, true)
+                .map_err(|e| anyhow::anyhow!("Error decoding prompt: {e}"))?;
             Ok((prompt, num_tokens))
+        }
+    }
+}
+
+/// Why a request failed.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    strum_macros::Display,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ErrorKind {
+    /// The server answered with a non-2xx status.
+    Http,
+    /// No complete answer within the request timeout.
+    Timeout,
+    /// Could not connect, or the connection broke.
+    Connection,
+    /// The stream ended early or sent no tokens.
+    Stream,
+    /// The server sent an error object in the stream.
+    Api,
+    /// The server sent something that is not a valid chunk.
+    Decode,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RequestError {
+    pub kind: ErrorKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    pub message: String,
+}
+
+impl RequestError {
+    pub fn new(kind: ErrorKind, message: String) -> Self {
+        Self {
+            kind,
+            http_status: None,
+            message,
+        }
+    }
+
+    fn from_eventsource(e: Error) -> Self {
+        match e {
+            Error::InvalidStatusCode(status, _) => Self {
+                kind: ErrorKind::Http,
+                http_status: Some(status.as_u16()),
+                message: status.to_string(),
+            },
+            Error::Transport(err) if err.is_timeout() => {
+                Self::new(ErrorKind::Timeout, err.to_string())
+            }
+            Error::Transport(err) => Self::new(ErrorKind::Connection, err.to_string()),
+            Error::InvalidContentType(..) | Error::Utf8(_) | Error::Parser(_) => {
+                Self::new(ErrorKind::Decode, e.to_string())
+            }
+            other => Self::new(ErrorKind::Stream, other.to_string()),
         }
     }
 }
@@ -719,64 +926,86 @@ fn tokenize_prompt(
 pub struct TextGenerationAggregatedResponse {
     pub start_time: Option<tokio::time::Instant>,
     pub end_time: Option<tokio::time::Instant>,
+    /// Wall-clock time the request was sent.
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub num_generated_tokens: u64,
+    /// Prompt tokens as counted by the server, when it reports usage.
+    pub num_prompt_tokens: Option<u64>,
     pub times_to_tokens: Vec<time::Duration>,
     last_received_token_time: tokio::time::Instant,
     pub failed: bool,
+    pub error: Option<RequestError>,
     pub ended: bool,
     pub request: Option<Arc<TextGenerationRequest>>,
     pub response: Option<String>,
+    /// Result of the request's check, filled in by the scheduler.
+    pub check: Option<CheckOutcome>,
 }
 
 impl TextGenerationAggregatedResponse {
     pub fn new(request: Arc<TextGenerationRequest>) -> Self {
         Self {
-            start_time: None,
-            end_time: None,
-            num_generated_tokens: 0,
-            times_to_tokens: Vec::new(),
-            last_received_token_time: tokio::time::Instant::now(),
-            failed: false,
-            ended: false,
             request: Some(request),
-            response: None,
+            ..Self::empty()
         }
     }
 
     pub fn new_as_ended() -> Self {
         Self {
+            ended: true,
+            ..Self::empty()
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
             start_time: None,
             end_time: None,
+            started_at: None,
             num_generated_tokens: 0,
+            num_prompt_tokens: None,
             times_to_tokens: Vec::new(),
             last_received_token_time: tokio::time::Instant::now(),
             failed: false,
-            ended: true,
+            error: None,
+            ended: false,
             request: None,
             response: None,
+            check: None,
         }
     }
+
     fn start(&mut self) {
         self.start_time = Some(tokio::time::Instant::now());
+        self.started_at = Some(chrono::Utc::now());
         self.last_received_token_time = tokio::time::Instant::now();
     }
 
+    /// Mark the answer complete. The first call wins: a finish chunk is
+    /// followed by a usage chunk and `[DONE]`, which must not move the end.
     fn stop(&mut self) {
-        self.end_time = Some(tokio::time::Instant::now());
+        if self.end_time.is_none() {
+            self.end_time = Some(tokio::time::Instant::now());
+        }
     }
 
-    fn fail(&mut self) {
+    pub(crate) fn fail(&mut self, error: RequestError) {
         self.end_time = Some(tokio::time::Instant::now());
         self.failed = true;
+        self.error = Some(error);
     }
 
     fn add_tokens(&mut self, num_tokens: u64) {
         self.num_generated_tokens += num_tokens;
         let time_to_generate = self.last_received_token_time.elapsed();
-        // make the assumption that when returned simultaneously, tokens were generated at a constant rate
-        time_to_generate.checked_div(num_tokens as u32).unwrap();
         self.last_received_token_time = tokio::time::Instant::now();
         self.times_to_tokens.push(time_to_generate);
+    }
+
+    /// Prompt tokens: the server's count when reported, else the request's.
+    pub fn prompt_tokens(&self) -> u64 {
+        self.num_prompt_tokens
+            .unwrap_or_else(|| self.request.as_ref().map_or(0, |r| r.num_prompt_tokens))
     }
 
     pub fn time_to_first_token(&self) -> Option<std::time::Duration> {
@@ -795,7 +1024,7 @@ impl TextGenerationAggregatedResponse {
                 for i in 1..self.times_to_tokens.len() {
                     total_time += self.times_to_tokens[i];
                 }
-                Some(total_time / (self.num_generated_tokens as u32 - 1))
+                Some(total_time / (self.num_generated_tokens.max(2) as u32 - 1))
             }
         }
     }
@@ -813,10 +1042,15 @@ mod tests {
     use crate::executors::ExecutorConfig;
     use crate::results::BenchmarkResults;
     use crate::scheduler::ExecutorType;
+    use std::path::PathBuf;
     use std::sync::atomic::AtomicU64;
     use std::thread::sleep;
     use std::time::Duration;
     use tokio::sync::RwLock;
+
+    pub(crate) fn test_tokenizer() -> Arc<Tokenizer> {
+        crate::test_util::tokenizer()
+    }
 
     #[tokio::test]
     async fn test_openai_token_count() {
@@ -833,7 +1067,7 @@ mod tests {
             })
             .create_async().await;
         let url = s.url().parse().unwrap();
-        let tokenizer = Arc::new(Tokenizer::from_pretrained("gpt2", None).unwrap());
+        let tokenizer = test_tokenizer();
         let backend = OpenAITextGenerationBackend::try_new(
             "".to_string(),
             url,
@@ -847,6 +1081,7 @@ mod tests {
             prompt: "Hello, world!".to_string(),
             num_prompt_tokens: 2,
             num_decode_tokens: Some(10),
+            ..Default::default()
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let request = Arc::new(request);
@@ -894,7 +1129,7 @@ mod tests {
             })
             .create_async().await;
         let url = s.url().parse().unwrap();
-        let tokenizer = Arc::new(Tokenizer::from_pretrained("gpt2", None).unwrap());
+        let tokenizer = test_tokenizer();
         let backend = OpenAITextGenerationBackend::try_new(
             "".to_string(),
             url,
@@ -908,6 +1143,7 @@ mod tests {
             prompt: "Hello, world!".to_string(),
             num_prompt_tokens: 2,
             num_decode_tokens: Some(16),
+            ..Default::default()
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let request = Arc::new(request);
@@ -979,7 +1215,7 @@ mod tests {
             .create_async()
             .await;
         let url = s.url().parse().unwrap();
-        let tokenizer = Arc::new(Tokenizer::from_pretrained("gpt2", None).unwrap());
+        let tokenizer = test_tokenizer();
         let backend = OpenAITextGenerationBackend::try_new(
             "".to_string(),
             url,
@@ -993,6 +1229,7 @@ mod tests {
             prompt: "Hello, world!".to_string(),
             num_prompt_tokens: 2,
             num_decode_tokens: Some(16),
+            ..Default::default()
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let request = Arc::new(request);
@@ -1025,7 +1262,7 @@ mod tests {
             .create_async()
             .await;
         let url = s.url().parse().unwrap();
-        let tokenizer = Arc::new(Tokenizer::from_pretrained("gpt2", None).unwrap());
+        let tokenizer = test_tokenizer();
         let backend = OpenAITextGenerationBackend::try_new(
             "".to_string(),
             url,
@@ -1039,6 +1276,7 @@ mod tests {
             prompt: "Hello, world!".to_string(),
             num_prompt_tokens: 2,
             num_decode_tokens: Some(16),
+            ..Default::default()
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let request = Arc::new(request);
@@ -1071,7 +1309,7 @@ mod tests {
             .create_async()
             .await;
         let url = s.url().parse().unwrap();
-        let tokenizer = Arc::new(Tokenizer::from_pretrained("gpt2", None).unwrap());
+        let tokenizer = test_tokenizer();
         let backend = OpenAITextGenerationBackend::try_new(
             "".to_string(),
             url,
@@ -1085,6 +1323,7 @@ mod tests {
             prompt: "Hello, world!".to_string(),
             num_prompt_tokens: 2,
             num_decode_tokens: Some(16),
+            ..Default::default()
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let request = Arc::new(request);
@@ -1121,7 +1360,7 @@ mod tests {
             })
             .create_async().await;
         let url = s.url().parse().unwrap();
-        let tokenizer = Arc::new(Tokenizer::from_pretrained("gpt2", None).unwrap());
+        let tokenizer = test_tokenizer();
         let backend = OpenAITextGenerationBackend::try_new(
             "".to_string(),
             url,
@@ -1135,6 +1374,7 @@ mod tests {
             prompt: "Hello, world!".to_string(),
             num_prompt_tokens: 2,
             num_decode_tokens: Some(16),
+            ..Default::default()
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let request = Arc::new(request);
@@ -1158,26 +1398,23 @@ mod tests {
     #[tokio::test]
     async fn test_load_conversations_from_file() {
         let filepath = PathBuf::from("test_data/conversations.json");
-        let tokenizer = "gpt2".to_string();
         let prompt_tokenize_opts = TokenizeOptions::default();
         let decode_tokenize_opts = TokenizeOptions::default();
-        let hf_token = None;
         let generator = ConversationTextRequestGenerator::load(
             filepath,
-            tokenizer,
+            test_tokenizer(),
             Some(prompt_tokenize_opts),
             Some(decode_tokenize_opts),
-            hf_token,
         )
         .unwrap();
-        assert_eq!(generator.requests.len(), 17016);
+        // one request per user message (system messages become history)
+        assert_eq!(generator.requests.len(), 17005);
     }
 
     /// Test that conversations are bounded by the min/max number of tokens
     #[tokio::test]
     async fn test_load_conversations_bounded() {
         let filepath = PathBuf::from("test_data/conversations.json");
-        let tokenizer = "gpt2".to_string();
         let prompt_tokenize_opts = TokenizeOptions {
             num_tokens: None,
             min_tokens: 4,
@@ -1185,13 +1422,11 @@ mod tests {
             variance: 0,
         };
         let decode_tokenize_opts = TokenizeOptions::default();
-        let hf_token = None;
         let generator = ConversationTextRequestGenerator::load(
             filepath,
-            tokenizer,
+            test_tokenizer(),
             Some(prompt_tokenize_opts),
             Some(decode_tokenize_opts),
-            hf_token,
         )
         .unwrap();
         let min_tokens = generator
@@ -1214,7 +1449,6 @@ mod tests {
     #[tokio::test]
     async fn test_load_conversations_fixed_tokens() {
         let filepath = PathBuf::from("test_data/conversations.json");
-        let tokenizer = "gpt2".to_string();
         let prompt_tokenize_opts = TokenizeOptions {
             num_tokens: Some(200),
             min_tokens: 200,
@@ -1222,13 +1456,11 @@ mod tests {
             variance: 0,
         };
         let decode_tokenize_opts = TokenizeOptions::default();
-        let hf_token = None;
         let generator = ConversationTextRequestGenerator::load(
             filepath,
-            tokenizer,
+            test_tokenizer(),
             Some(prompt_tokenize_opts),
             Some(decode_tokenize_opts),
-            hf_token,
         )
         .unwrap();
         for r in generator.requests.iter() {
@@ -1237,25 +1469,22 @@ mod tests {
     }
 
     /// Test that multi-turn conversations are correctly loaded
-    /// The test data contains 2 conversations first with 6 turns and the second with 1 turn and a system prompt
+    /// The test data contains 2 conversations: the first with 6 user turns, the second with a system prompt and 1 user turn
     #[tokio::test]
     async fn test_load_conversations_multi_turn() {
         let filepath = PathBuf::from("test_data/chat.json");
-        let tokenizer = "gpt2".to_string();
         let prompt_tokenize_opts = TokenizeOptions {
             num_tokens: None,
             min_tokens: 1,
             max_tokens: 200,
             variance: 0,
         };
-        let hf_token = None;
         let decode_tokenize_opts = TokenizeOptions::default();
         let generator = ConversationTextRequestGenerator::load(
             filepath,
-            tokenizer,
+            test_tokenizer(),
             Some(prompt_tokenize_opts),
             Some(decode_tokenize_opts),
-            hf_token,
         )
         .unwrap();
         let turns = generator
@@ -1263,7 +1492,7 @@ mod tests {
             .into_iter()
             .map(|r| r.1.clone())
             .collect::<Vec<ConversationTurnRequest>>();
-        assert_eq!(turns.len(), 8);
+        assert_eq!(turns.len(), 7);
         let first_turns = turns.clone().into_iter().filter(|t| t.priority == 0);
         // we expect to have 2 None values for the first turn in each conversation
         assert_eq!(first_turns.count(), 2);
@@ -1295,21 +1524,18 @@ mod tests {
     #[tokio::test]
     async fn test_conversation_queue() {
         let filepath = PathBuf::from("test_data/chat.json");
-        let tokenizer = "gpt2".to_string();
         let prompt_tokenize_opts = TokenizeOptions {
             num_tokens: None,
             min_tokens: 1,
             max_tokens: 200,
             variance: 0,
         };
-        let hf_token = None;
         let decode_tokenize_opts = TokenizeOptions::default();
         let mut generator = ConversationTextRequestGenerator::load(
             filepath,
-            tokenizer,
+            test_tokenizer(),
             Some(prompt_tokenize_opts),
             Some(decode_tokenize_opts),
-            hf_token,
         )
         .unwrap();
         for i in 0..20 {
@@ -1319,8 +1545,15 @@ mod tests {
                 assert_eq!(req.prompt, "Summarize the main ideas of Jeff Walker's Product Launch Formula into bullet points as it pertains to a growth marketing agency implementing these strategies and tactics for their clients...");
             }
             if i % 2 == 1 {
-                // first turn of the second conversation
-                assert_eq!(req.prompt, "You are a helpful assistant.");
+                // first turn of the second conversation, its system prompt as history
+                assert!(req.prompt.starts_with("How to tell if a customer segment"));
+                assert_eq!(
+                    req.history,
+                    vec![OpenAITextGenerationMessage::new(
+                        "system",
+                        "You are a helpful assistant."
+                    )]
+                );
             }
         }
     }
@@ -1329,40 +1562,55 @@ mod tests {
     #[tokio::test]
     async fn test_conversation_turns_queue() {
         let filepath = PathBuf::from("test_data/chat.json");
-        let tokenizer = "gpt2".to_string();
         let prompt_tokenize_opts = TokenizeOptions {
             num_tokens: None,
             min_tokens: 1,
             max_tokens: 200,
             variance: 0,
         };
-        let hf_token = None;
         let decode_tokenize_opts = TokenizeOptions::default();
         let mut generator = ConversationTextRequestGenerator::load(
             filepath,
-            tokenizer,
+            test_tokenizer(),
             Some(prompt_tokenize_opts),
             Some(decode_tokenize_opts),
-            hf_token,
         )
         .unwrap();
+        const FIRST: &str = "Summarize the main ideas of Jeff Walker's Product Launch Formula into bullet points as it pertains to a growth marketing agency implementing these strategies and tactics for their clients...";
+        const SECOND: &str = "Summarize the main ideas of Brendon Burchard's Experts Academy into bullet points as it pertains to a growth marketing agency implementing these strategies and tactics for their clients...";
         // generate the first user turn
+        let first = generator.generate_request();
+        assert_eq!(first.prompt, FIRST);
+        generator.callback(Arc::from(first.clone()), "This is my response");
+        // the next turn carries the conversation so far, including the model's answer
         let req = generator.generate_request();
-        let response = "This is my response".to_string();
-        generator.callback(Arc::from(req), &response);
-        // now try to generate the next user turn
-        let req = generator.generate_request();
-        // we expect to have all the turns concatenated into the prompt
-        assert_eq!(req.prompt, "Summarize the main ideas of Jeff Walker's Product Launch Formula into bullet points as it pertains to a growth marketing agency implementing these strategies and tactics for their clients...\nThis is my response\nSummarize the main ideas of Brendon Burchard's Experts Academy into bullet points as it pertains to a growth marketing agency implementing these strategies and tactics for their clients...");
-        assert_eq!(req.num_prompt_tokens, 76);
+        assert_eq!(req.prompt, SECOND);
+        assert_eq!(
+            req.history,
+            vec![
+                OpenAITextGenerationMessage::new("user", FIRST),
+                OpenAITextGenerationMessage::new("assistant", "This is my response"),
+            ]
+        );
+        assert_eq!(req.turn, 1);
+        let tokenizer = test_tokenizer();
+        assert_eq!(
+            req.num_prompt_tokens,
+            first.num_prompt_tokens
+                + count_tokens(&tokenizer, "This is my response")
+                + count_tokens(&tokenizer, SECOND)
+        );
         // now add a response to the second turn
-        let response = "This is my second response".to_string();
-        generator.callback(Arc::from(req), &response);
-        // now try to generate the next user turn
+        generator.callback(Arc::from(req), "This is my second response");
         let req = generator.generate_request();
-        assert_eq!(req.prompt, "Summarize the main ideas of Jeff Walker's Product Launch Formula into bullet points as it pertains to a growth marketing agency implementing these strategies and tactics for their clients...\nThis is my response\nSummarize the main ideas of Brendon Burchard's Experts Academy into bullet points as it pertains to a growth marketing agency implementing these strategies and tactics for their clients...\nThis is my second response\nWhat are the mental triggers in Jeff Walker's Product Launch Formula and \"Launch\" book?");
+        assert_eq!(
+            req.prompt,
+            "What are the mental triggers in Jeff Walker's Product Launch Formula and \"Launch\" book?"
+        );
+        assert_eq!(req.history.len(), 4);
+        assert_eq!(req.history[3].content, "This is my second response");
         // check that next turn is a first turn
         let req = generator.generate_request();
-        assert_eq!(req.prompt, "You are a helpful assistant.");
+        assert!(req.prompt.starts_with("How to tell if a customer segment"));
     }
 }

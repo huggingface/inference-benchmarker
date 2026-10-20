@@ -211,7 +211,7 @@ impl App {
                     let throughput = r.token_throughput_secs().unwrap_or(0.0);
                     Some((r.executor_config().rate.unwrap(), throughput))
                 }
-                ExecutorType::ConstantVUs => None,
+                ExecutorType::ConstantVUs | ExecutorType::Scheduled => None,
             })
             .collect::<Vec<_>>();
         let token_throughput_vus = state
@@ -222,7 +222,7 @@ impl App {
                     let throughput = r.token_throughput_secs().unwrap_or(0.0);
                     Some((r.executor_config().max_vus as f64, throughput))
                 }
-                ExecutorType::ConstantArrivalRate => None,
+                ExecutorType::ConstantArrivalRate | ExecutorType::Scheduled => None,
             })
             .collect::<Vec<_>>();
         let inter_token_latency_rate = state
@@ -236,7 +236,7 @@ impl App {
                         .as_secs_f64();
                     Some((r.executor_config().rate.unwrap(), latency))
                 }
-                ExecutorType::ConstantVUs => None,
+                ExecutorType::ConstantVUs | ExecutorType::Scheduled => None,
             })
             .collect::<Vec<_>>();
         let inter_token_latency_vus = state
@@ -250,7 +250,7 @@ impl App {
                         .as_secs_f64();
                     Some((r.executor_config().max_vus as f64, latency))
                 }
-                ExecutorType::ConstantArrivalRate => None,
+                ExecutorType::ConstantArrivalRate | ExecutorType::Scheduled => None,
             })
             .collect::<Vec<_>>();
         HashMap::from([

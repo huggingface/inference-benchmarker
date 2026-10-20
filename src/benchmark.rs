@@ -1,9 +1,14 @@
-use crate::requests::{TextGenerationBackend, TextRequestGenerator, TokenizeOptions};
+use crate::cost::GpuCost;
+use crate::executors::{Executor, ExecutorConfig, ScheduledExecutor};
+use crate::record::RecordSink;
+use crate::requests::{
+    TextGenerationBackend, TextGenerationRequest, TextRequestGenerator, TokenizeOptions,
+};
 use crate::results::{BenchmarkReport, BenchmarkResults};
-use crate::scheduler::{ExecutorType, SchedulerProgress};
-use crate::{executors, scheduler};
+use crate::scheduler::{ExecutorType, Scheduler, SchedulerProgress};
+use crate::slo::Slo;
 use log::{debug, info};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,12 +16,23 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{broadcast, mpsc, Mutex};
 
 const THROUGHPUT_BUDGET: f64 = 1.2; // sweep up to 120% of max throughput
+/// Request timeout of runs without a duration (`Once`, `Replay`).
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
-#[derive(Clone, Debug, strum_macros::Display, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, strum_macros::Display, Serialize, Deserialize)]
 pub enum BenchmarkKind {
+    /// Constant concurrency (`max_vus`) for `duration`.
     Throughput,
+    /// Throughput, then `num_rates` constant rates up to 120% of the maximum.
+    #[default]
     Sweep,
+    /// The given constant `rates`.
     Rate,
+    /// Every request of the workload exactly once, as fast as `max_vus` allows:
+    /// accuracy and conversation suites.
+    Once,
+    /// Recorded traffic, each request at its recorded offset divided by `replay_speed`.
+    Replay,
 }
 
 pub struct MessageEvent {
@@ -35,6 +51,32 @@ pub struct BenchmarkEvent {
     pub failed_requests: u64,
 }
 
+impl BenchmarkEvent {
+    fn started(id: &str, scheduler_type: ExecutorType) -> Self {
+        Self {
+            id: id.to_string(),
+            scheduler_type,
+            request_throughput: None,
+            progress: 0.0,
+            results: None,
+            successful_requests: 0,
+            failed_requests: 0,
+        }
+    }
+
+    fn ended(id: &str, scheduler_type: ExecutorType, results: &BenchmarkResults) -> Self {
+        Self {
+            id: id.to_string(),
+            scheduler_type,
+            request_throughput: results.successful_request_rate().ok(),
+            progress: 100.0,
+            results: Some(results.clone()),
+            successful_requests: results.successful_requests() as u64,
+            failed_requests: results.failed_requests() as u64,
+        }
+    }
+}
+
 pub enum Event {
     BenchmarkStart(BenchmarkEvent),
     BenchmarkProgress(BenchmarkEvent),
@@ -49,20 +91,28 @@ pub struct Benchmark {
     end_time: Option<tokio::time::Instant>,
     backend: Box<dyn TextGenerationBackend + Send + Sync>,
     requests: Arc<Mutex<dyn TextRequestGenerator + Send>>,
+    /// The chains of a `Once` or `Replay` run (a request, or a conversation's turns).
+    schedule: Vec<Vec<Arc<TextGenerationRequest>>>,
+    records: Option<RecordSink>,
     report: BenchmarkReport,
     pub(crate) config: BenchmarkConfig,
     event_bus: mpsc::UnboundedSender<Event>,
     stop_sender: broadcast::Sender<()>,
 }
 
+fn default_replay_speed() -> f64 {
+    1.0
+}
+
 #[serde_with::serde_as]
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BenchmarkConfig {
     pub max_vus: u64,
     #[serde(rename = "duration_secs")]
     #[serde_as(as = "serde_with::DurationSeconds<u64>")]
     pub duration: Duration,
     pub benchmark_kind: BenchmarkKind,
+    /// 0 skips the warmup.
     #[serde(rename = "warmup_duration_secs")]
     #[serde_as(as = "serde_with::DurationSeconds<u64>")]
     pub warmup_duration: Duration,
@@ -76,6 +126,41 @@ pub struct BenchmarkConfig {
     #[serde(rename = "meta")]
     pub extra_metadata: Option<HashMap<String, String>>,
     pub run_id: String,
+    /// `Replay` only: 1.0 is real time, 2.0 twice as fast, 0 as fast as possible.
+    #[serde(default = "default_replay_speed")]
+    pub replay_speed: f64,
+    /// Per-request timeout; defaults to `duration`, or 10 minutes without one.
+    #[serde(default, rename = "request_timeout_secs")]
+    #[serde_as(as = "Option<serde_with::DurationSeconds<u64>>")]
+    pub request_timeout: Option<Duration>,
+    #[serde(default)]
+    pub slo: Option<Slo>,
+    #[serde(default)]
+    pub gpu_cost: Option<GpuCost>,
+}
+
+impl Default for BenchmarkConfig {
+    fn default() -> Self {
+        Self {
+            max_vus: 0,
+            duration: Duration::ZERO,
+            benchmark_kind: BenchmarkKind::default(),
+            warmup_duration: Duration::ZERO,
+            rates: None,
+            num_rates: 0,
+            prompt_options: None,
+            decode_options: None,
+            tokenizer: String::new(),
+            model_name: String::new(),
+            profile: None,
+            extra_metadata: None,
+            run_id: String::new(),
+            replay_speed: default_replay_speed(),
+            request_timeout: None,
+            slo: None,
+            gpu_cost: None,
+        }
+    }
 }
 
 impl BenchmarkConfig {
@@ -83,36 +168,51 @@ impl BenchmarkConfig {
         if self.max_vus == 0 {
             return Err(anyhow::anyhow!("max_vus must be greater than 0"));
         }
-        if self.duration.as_secs() == 0 {
+        let scheduled = matches!(
+            self.benchmark_kind,
+            BenchmarkKind::Once | BenchmarkKind::Replay
+        );
+        if !scheduled && self.duration.is_zero() {
             return Err(anyhow::anyhow!("duration must be greater than 0"));
         }
-        if self.warmup_duration.as_secs() == 0 {
-            return Err(anyhow::anyhow!("warmup_duration must be greater than 0"));
-        }
         match self.benchmark_kind {
-            BenchmarkKind::Throughput => {
-                if self.rates.is_some() {
-                    return Err(anyhow::anyhow!(
-                        "rates must not be specified for throughput benchmark"
-                    ));
-                }
-            }
-            BenchmarkKind::Sweep => {
-                if self.rates.is_some() {
-                    return Err(anyhow::anyhow!(
-                        "rates must not be specified for sweep benchmark"
-                    ));
-                }
-            }
             BenchmarkKind::Rate => {
-                if self.rates.is_none() {
+                if self.rates.as_ref().is_none_or(|r| r.is_empty()) {
                     return Err(anyhow::anyhow!(
                         "rates must be specified for rate benchmark"
                     ));
                 }
+                if self.rates.iter().flatten().any(|r| *r <= 0.0) {
+                    return Err(anyhow::anyhow!("rates must be greater than 0"));
+                }
+            }
+            ref kind => {
+                if self.rates.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "rates must not be specified for {} benchmark",
+                        kind.to_string().to_lowercase()
+                    ));
+                }
             }
         }
+        if !self.replay_speed.is_finite() || self.replay_speed < 0.0 {
+            return Err(anyhow::anyhow!("replay_speed must be 0 or more"));
+        }
+        if let Some(slo) = &self.slo {
+            slo.validate()?;
+        }
+        if let Some(cost) = &self.gpu_cost {
+            cost.validate()?;
+        }
         Ok(())
+    }
+
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout.unwrap_or(if self.duration.is_zero() {
+            DEFAULT_REQUEST_TIMEOUT
+        } else {
+            self.duration
+        })
     }
 }
 
@@ -136,9 +236,24 @@ impl Benchmark {
             config: config.clone(),
             backend,
             requests,
+            schedule: Vec::new(),
+            records: None,
             event_bus,
             stop_sender,
         }
+    }
+
+    /// What a `Once` or `Replay` run sends: chains of one request, or the
+    /// turns of one conversation.
+    pub fn with_schedule(mut self, schedule: Vec<Vec<Arc<TextGenerationRequest>>>) -> Self {
+        self.schedule = schedule;
+        self
+    }
+
+    /// Send a trace record for every request.
+    pub fn with_records(mut self, records: Option<RecordSink>) -> Self {
+        self.records = records;
+        self
     }
 
     pub fn get_report(&self) -> BenchmarkReport {
@@ -148,9 +263,11 @@ impl Benchmark {
     pub async fn run(&mut self) -> anyhow::Result<BenchmarkReport> {
         self.start_time = Some(tokio::time::Instant::now());
         self.report.start();
-        info!("Prewarming backend");
-        self.warmup().await?;
-        info!("Prewarm complete");
+        if !self.config.warmup_duration.is_zero() {
+            info!("Prewarming backend");
+            self.warmup().await?;
+            info!("Prewarm complete");
+        }
         match self.config.benchmark_kind {
             BenchmarkKind::Throughput => {
                 self.run_throughput().await?;
@@ -161,16 +278,19 @@ impl Benchmark {
             BenchmarkKind::Rate => {
                 self.run_rates().await?;
             }
+            BenchmarkKind::Once => {
+                self.run_scheduled("once", None).await?;
+            }
+            BenchmarkKind::Replay => {
+                let speed = self.config.replay_speed;
+                self.run_scheduled("replay", Some(speed)).await?;
+            }
         }
         self.end_time = Some(tokio::time::Instant::now());
-        self.event_bus.send(Event::Message(MessageEvent {
-            message: format!(
-                "Benchmark complete in {:?}",
-                self.duration().expect("duration exists")
-            ),
-            timestamp: chrono::Utc::now(),
-            level: log::Level::Info,
-        }))?;
+        self.message(format!(
+            "Benchmark complete in {:?}",
+            self.duration().unwrap_or_default()
+        ));
         self.report.end();
         Ok(self.report.clone())
     }
@@ -182,7 +302,24 @@ impl Benchmark {
         }
     }
 
-    async fn handle_progress(&self, id: String) -> Sender<Option<SchedulerProgress>> {
+    /// Events are best effort: a caller that stopped listening must not stop the run.
+    fn emit(&self, event: Event) {
+        let _ = self.event_bus.send(event);
+    }
+
+    fn message(&self, message: String) {
+        self.emit(Event::Message(MessageEvent {
+            message,
+            timestamp: chrono::Utc::now(),
+            level: log::Level::Info,
+        }));
+    }
+
+    async fn handle_progress(
+        &self,
+        id: String,
+        scheduler_type: ExecutorType,
+    ) -> Sender<Option<SchedulerProgress>> {
         let (tx, mut rx): (
             Sender<Option<SchedulerProgress>>,
             Receiver<Option<SchedulerProgress>>,
@@ -201,7 +338,7 @@ impl Benchmark {
                         };
                         let _ = event_bus.send(Event::BenchmarkProgress(BenchmarkEvent {
                             id: progress_evt.id,
-                            scheduler_type: ExecutorType::ConstantVUs,
+                            scheduler_type: scheduler_type.clone(),
                             request_throughput: Some(progress_evt.progress.requests_throughput),
                             progress: progress_evt.progress.progress,
                             successful_requests: progress_evt.progress.successful_requests,
@@ -215,144 +352,101 @@ impl Benchmark {
         tx
     }
 
+    /// Run one step and add its results to the report. `executor` overrides the
+    /// executor `executor_type` would build (scheduled steps bring their own).
+    async fn run_step(
+        &mut self,
+        id: &str,
+        executor_type: ExecutorType,
+        config: ExecutorConfig,
+        executor: Option<Box<dyn Executor + Send>>,
+    ) -> anyhow::Result<BenchmarkResults> {
+        self.emit(Event::BenchmarkStart(BenchmarkEvent::started(
+            id,
+            executor_type.clone(),
+        )));
+        let tx = self
+            .handle_progress(id.to_string(), executor_type.clone())
+            .await;
+        let scheduler = match executor {
+            Some(executor) => Ok(Scheduler::with_executor(
+                id.to_string(),
+                executor,
+                executor_type.clone(),
+                config,
+                self.requests.clone(),
+                tx.clone(),
+                self.stop_sender.clone(),
+            )),
+            None => Scheduler::new(
+                id.to_string(),
+                self.backend.clone(),
+                executor_type.clone(),
+                config,
+                self.requests.clone(),
+                tx.clone(),
+                self.stop_sender.clone(),
+            ),
+        };
+        let results = match scheduler {
+            Ok(scheduler) => scheduler.with_records(self.records.clone()).run().await,
+            Err(e) => Err(e),
+        };
+        // close the progress handler, also when the step failed
+        let _ = tx.send(None).await;
+        let results = results?;
+        self.report.add_benchmark_result(results.clone());
+        self.emit(Event::BenchmarkEnd(BenchmarkEvent::ended(
+            id,
+            executor_type,
+            &results,
+        )));
+        Ok(results)
+    }
+
     pub async fn warmup(&mut self) -> anyhow::Result<()> {
         // run a warmup benchmark to prewarm the server
-
-        let id = "warmup".to_string();
-
-        // notify start event
-        self.event_bus.send(Event::BenchmarkStart(BenchmarkEvent {
-            id: id.to_string(),
-            scheduler_type: ExecutorType::ConstantVUs,
-            request_throughput: None,
-            progress: 0.0,
-            results: None,
-            successful_requests: 0,
-            failed_requests: 0,
-        }))?;
-
-        // create progress handler
-        let tx = self.handle_progress(id.clone()).await;
-
-        // start scheduler
-        let mut scheduler = scheduler::Scheduler::new(
-            id,
-            self.backend.clone(),
-            ExecutorType::ConstantVUs,
-            executors::ExecutorConfig {
-                max_vus: 1,
-                duration: self.config.warmup_duration,
-                rate: None,
-            },
-            self.requests.clone(),
-            tx.clone(),
-            self.stop_sender.clone(),
-        );
-        scheduler.run().await?;
-
-        let results = scheduler.get_results().lock().await.clone();
-        self.report.add_benchmark_result(results.clone());
-
-        // send None to close the progress handler
-        tx.send(None).await.unwrap();
-
-        // notify end event
-        self.event_bus.send(Event::BenchmarkEnd(BenchmarkEvent {
-            id: "warmup".to_string(),
-            scheduler_type: ExecutorType::ConstantVUs,
-            request_throughput: results.successful_request_rate().ok(),
-            progress: 100.0,
-            results: Some(results.clone()),
-            successful_requests: results.successful_requests() as u64,
-            failed_requests: results.failed_requests() as u64,
-        }))?;
+        let config = ExecutorConfig {
+            max_vus: 1,
+            duration: self.config.warmup_duration,
+            rate: None,
+        };
+        self.run_step("warmup", ExecutorType::ConstantVUs, config, None)
+            .await?;
         Ok(())
     }
 
-    pub async fn run_throughput(&mut self) -> anyhow::Result<()> {
+    pub async fn run_throughput(&mut self) -> anyhow::Result<BenchmarkResults> {
         info!("Running throughput benchmark");
-
-        let id = "throughput".to_string();
-
-        // notify start event
-        self.event_bus.send(Event::BenchmarkStart(BenchmarkEvent {
-            id: id.clone(),
-            scheduler_type: ExecutorType::ConstantVUs,
-            request_throughput: None,
-            progress: 0.0,
-            results: None,
-            successful_requests: 0,
-            failed_requests: 0,
-        }))?;
-
-        // create progress handler
-        let tx = self.handle_progress(id.clone()).await;
-
-        // start scheduler
-        let mut scheduler = scheduler::Scheduler::new(
-            id.clone(),
-            self.backend.clone(),
-            ExecutorType::ConstantVUs,
-            executors::ExecutorConfig {
-                max_vus: self.config.max_vus,
-                duration: self.config.duration,
-                rate: None,
-            },
-            self.requests.clone(),
-            tx.clone(),
-            self.stop_sender.clone(),
-        );
-        scheduler.run().await?;
-        let results = scheduler.get_results().lock().await.clone();
-        let rate = results.successful_request_rate().ok();
-        self.report.add_benchmark_result(results.clone());
-
-        // send None to close the progress handler
-        tx.send(None).await.unwrap();
-
-        // notify end event
-        self.event_bus.send(Event::BenchmarkEnd(BenchmarkEvent {
-            id: id.clone(),
-            scheduler_type: ExecutorType::ConstantVUs,
-            request_throughput: rate,
-            progress: 100.0,
-            results: Some(results.clone()),
-            successful_requests: results.successful_requests() as u64,
-            failed_requests: results.failed_requests() as u64,
-        }))?;
-        Ok(())
+        let config = ExecutorConfig {
+            max_vus: self.config.max_vus,
+            duration: self.config.duration,
+            rate: None,
+        };
+        self.run_step("throughput", ExecutorType::ConstantVUs, config, None)
+            .await
     }
 
     pub async fn run_sweep(&mut self) -> anyhow::Result<()> {
         // run a throughput benchmark to retrieve the maximum throughput of server
-        self.run_throughput().await?;
-        // get the max throughput from the second benchmark result (first is warmup)
-        let throughput_results = &self.report.get_results()[1];
+        let throughput_results = self.run_throughput().await?;
         let max_throughput = throughput_results.successful_request_rate()?;
         let max_tokens_throughput = throughput_results.token_throughput_secs()?;
-        // notify event bus
-        self.event_bus.send(Event::Message(MessageEvent {
-            message: format!(
-                "Max throughput detected at: {:.2} req/s | {:.2} tokens/s",
-                max_throughput, max_tokens_throughput
-            ),
-            timestamp: chrono::Utc::now(),
-            level: log::Level::Info,
-        }))?;
-        // run a sweep benchmark for 10 different rates from 1req/s to max throughput
-        let mut rates = Vec::new();
+        self.message(format!(
+            "Max throughput detected at: {:.2} req/s | {:.2} tokens/s",
+            max_throughput, max_tokens_throughput
+        ));
+        // run a sweep benchmark for `num_rates` rates from 1 req/s to max throughput
         let num_rates = self.config.num_rates;
         for i in 1..=num_rates {
-            rates.push(i as f64 * max_throughput * THROUGHPUT_BUDGET / num_rates as f64);
-        }
-        for rate in rates {
+            let rate = i as f64 * max_throughput * THROUGHPUT_BUDGET / num_rates as f64;
             self.run_rate(rate).await?;
         }
         Ok(())
     }
 
     pub async fn run_rates(&mut self) -> anyhow::Result<()> {
-        let rates = self.config.rates.clone().expect("config already validated");
+        let rates = self.config.rates.clone().unwrap_or_default();
         for rate in rates {
             self.run_rate(rate).await?;
         }
@@ -361,54 +455,39 @@ impl Benchmark {
 
     pub async fn run_rate(&mut self, rate: f64) -> anyhow::Result<()> {
         debug!("Running benchmark with rate: {} req/s", rate);
-
+        let config = ExecutorConfig {
+            max_vus: self.config.max_vus,
+            duration: self.config.duration,
+            rate: Some(rate),
+        };
         let id = format!("constant@{:.2}req/s", rate);
+        self.run_step(&id, ExecutorType::ConstantArrivalRate, config, None)
+            .await?;
+        Ok(())
+    }
 
-        // notify start event
-        self.event_bus.send(Event::BenchmarkStart(BenchmarkEvent {
-            id: id.clone(),
-            scheduler_type: ExecutorType::ConstantArrivalRate,
-            request_throughput: None,
-            progress: 0.0,
-            results: None,
-            successful_requests: 0,
-            failed_requests: 0,
-        }))?;
-
-        // create progress handler
-        let tx = self.handle_progress(id.clone()).await;
-
-        // start scheduler
-        let mut scheduler = scheduler::Scheduler::new(
-            id,
+    /// Send every scheduled request once; at recorded times when `speed` is set.
+    pub async fn run_scheduled(&mut self, id: &str, speed: Option<f64>) -> anyhow::Result<()> {
+        if self.schedule.is_empty() {
+            return Err(anyhow::anyhow!(
+                "A {id} benchmark needs a list of requests or conversations"
+            ));
+        }
+        info!("Running {id} benchmark of {} chains", self.schedule.len());
+        let executor = ScheduledExecutor::new(
             self.backend.clone(),
-            scheduler::ExecutorType::ConstantArrivalRate,
-            executors::ExecutorConfig {
-                max_vus: self.config.max_vus,
-                duration: self.config.duration,
-                rate: Some(rate),
-            },
-            self.requests.clone(),
-            tx.clone(),
-            self.stop_sender.clone(),
+            self.config.max_vus,
+            self.schedule.clone(),
+            speed,
         );
-        scheduler.run().await?;
-        let results = scheduler.get_results().lock().await.clone();
-        self.report.add_benchmark_result(results.clone());
-
-        // send None to close the progress handler
-        tx.send(None).await.unwrap();
-
-        // notify end event
-        self.event_bus.send(Event::BenchmarkEnd(BenchmarkEvent {
-            id: format!("constant@{:.2}req/s", rate),
-            scheduler_type: ExecutorType::ConstantArrivalRate,
-            request_throughput: results.successful_request_rate().ok(),
-            progress: 100.0,
-            results: Some(results.clone()),
-            successful_requests: results.successful_requests() as u64,
-            failed_requests: results.failed_requests() as u64,
-        }))?;
+        let config = executor.config();
+        self.run_step(
+            id,
+            ExecutorType::Scheduled,
+            config,
+            Some(Box::new(executor)),
+        )
+        .await?;
         Ok(())
     }
 }
@@ -444,6 +523,7 @@ mod tests {
                 profile: None,
                 extra_metadata: None,
                 run_id: "test".to_string(),
+                ..Default::default()
             },
             backend,
             requests_generator,
